@@ -112,7 +112,9 @@ class TelemetryDashboard(App):
             {"label": "GYROSCOPE - Z (dps)", "color": (1, 0.4, 0.7, 1)}
         ]
         
-        self.graph_areas, self.plot_lines, self.plot_bgs = [], [], []
+        self.graph_areas = []
+        self.plot_lines = []
+        self.plot_bgs = []
         
         for meta in graph_meta:
             card = BoxLayout(orientation='vertical', padding=3, size_hint_y=None, height=160)
@@ -220,7 +222,6 @@ class TelemetryDashboard(App):
         popup.open()
 
     def reset_entire_dashboard(self, instance=None):
-        """Clears trace buffers and resets display console labels."""
         self.buffers = [deque([0.0] * self.points_count, maxlen=self.points_count) for _ in range(13)]
         
         self.lbl_hand_data.text = (
