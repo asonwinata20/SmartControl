@@ -5,8 +5,11 @@ import subprocess
 import os
 import struct
 from enum import IntEnum
+import numpy as np
+from collections import deque
 
-# --- HARDWARE INTEGRATION GUARDS ---
+import tensorflow as tf
+
 try:
     import board
     import busio
@@ -139,7 +142,6 @@ class CubeMarsCANManager:
                 pass
 
     def emergency_release_all(self):
-        """Immediately unlocks motors to neutral position upon E-Stop."""
         with self.bus_lock:
             for cid in self.controller_ids:
                 self.motor_states[cid]["state"] = "UNLOCKED"
@@ -205,14 +207,15 @@ class CubeMarsCANManager:
     def get_motor_state_data(self, cid: int) -> tuple[float, float, float]:
         with self.bus_lock:
             st = self.motor_states.get(cid, {})
-            pos = self.telemetry.get(cid, {}).get("position_deg", 0.0)
-            spd = st.get("speed", 0.0)
+            telem = self.telemetry.get(cid, {})
+            pos = telem.get("position_deg", 0.0)
+            spd = telem.get("speed_erpm", 0.0)
             acc = st.get("accel", 0.0)
             return pos, spd, acc
 
 
 class SensorAcquisitionWorker:
-    def __init__(self, data_queue):
+    def __init__(self, data_queue, model_path="multiLSTM-LOSO.keras"):
         self.data_queue = data_queue
         self.running = True
         self.is_streaming = False
@@ -239,15 +242,104 @@ class SensorAcquisitionWorker:
         self.current_movement_label = "IDLE"
         self.movement_thread = None
 
-        # --- SAFETY & SMART AAN STATE MACHINE ---
+        self.auto_lstm_enabled = False
+        self.model_path = model_path
+        self.model = None
+        self.class_labels = ['Extension', 'Flexion', 'Grasping', 'Radial', 'Ulnar']
+        
+        self.raw_emg_buffer_f = deque(maxlen=30)
+        self.raw_emg_buffer_e = deque(maxlen=30)
+        self.sequence_tensor_buffer = deque(maxlen=6)
+
         self.e_stop_triggered = False
         self.e_stop_reason = ""
-        self.safety_overshoot_margin_deg = 5.0 # Max allowed overshoot buffer
+        self.safety_overshoot_margin_deg = 5.0
 
-    def voltage_to_percentage(self, volts, v_min, v_max):
-        if volts <= v_min: return 0.0
-        if volts >= v_max: return 100.0
-        return round(((volts - v_min) / (v_max - v_min)) * 100.0, 1)
+        self.init_tf_model()
+
+    def init_tf_model(self):
+        if os.path.exists(self.model_path):
+            try:
+                self.model = tf.keras.models.load_model(self.model_path)
+                print(f"🧠 TensorFlow Model '{self.model_path}' loaded successfully!")
+            except Exception as e:
+                print(f"⚠️ Error loading Keras model: {e}")
+        else:
+            print(f"⚠️ Model file '{self.model_path}' not found in directory.")
+
+    def toggle_auto_lstm_control(self, enable: bool):
+        self.auto_lstm_enabled = enable
+        if enable:
+            self.calibrate_imu_bias()
+            self.current_movement_label = "LSTM_MONITORING"
+            self.is_streaming = True
+        else:
+            self.auto_lstm_enabled = False
+            self.is_streaming = False
+            self.current_movement_label = "IDLE"
+
+    def extract_td_features(self, w_flex, w_ext, eps=1e-6):
+        """Extracts 13 Time-Domain sEMG features matching model_86pc.keras input shape."""
+        w_f, w_e = np.array(w_flex), np.array(w_ext)
+        
+        rms_f, rms_e = np.sqrt(np.mean(w_f**2)), np.sqrt(np.mean(w_e**2))
+        mav_f, mav_e = np.mean(np.abs(w_f)), np.mean(np.abs(w_e))
+        wl_f, wl_e = np.sum(np.abs(np.diff(w_f))), np.sum(np.abs(np.diff(w_e)))
+        zc_f = np.sum((w_f[:-1] * w_f[1:] < 0))
+        zc_e = np.sum((w_e[:-1] * w_e[1:] < 0))
+        var_f, var_e = np.var(w_f), np.var(w_e)
+        ssc_f = np.sum(np.diff(np.sign(np.diff(w_f))) != 0)
+        ssc_e = np.sum(np.diff(np.sign(np.diff(w_e))) != 0)
+        
+        # Cross-channel Log-RMS Ratio
+        log_ratio = np.log((rms_f + eps) / (rms_e + eps))
+        
+        # Total = 13 features
+        return [
+            rms_f, rms_e, 
+            mav_f, mav_e, 
+            wl_f, wl_e, 
+            zc_f, zc_e, 
+            var_f, var_e, 
+            ssc_f, ssc_e, 
+            log_ratio
+        ]
+
+    def run_inference_step(self, flex_data, imu_acc, imu_gyr):
+        if len(self.raw_emg_buffer_f) < 30 or self.model is None:
+            return None, 0.0
+
+        # Extract 13 sEMG TD + 5 Flex + 6 IMU = 24 features
+        td = self.extract_td_features(self.raw_emg_buffer_f, self.raw_emg_buffer_e)
+        frame_features = td + flex_data + imu_acc + imu_gyr
+        self.sequence_tensor_buffer.append(frame_features)
+
+        if len(self.sequence_tensor_buffer) < 6:
+            return None, 0.0
+
+        # Construct shape (1, 6, 24) tensor
+        input_data = np.array(self.sequence_tensor_buffer, dtype=np.float32)
+        
+        # Ensure feature dimension strictly matches model expectation
+        expected_features = self.model.input_shape[-1]  # Automatically reads 24
+        if input_data.shape[-1] > expected_features:
+            input_data = input_data[:, :expected_features]
+            
+        input_data = np.expand_dims(input_data, axis=0)
+
+        # Execute Keras inference
+        outputs = self.model(input_data, training=False)
+        
+        if isinstance(outputs, list):
+            class_probs = outputs[0].numpy()[0]
+        else:
+            class_probs = outputs.numpy()[0]
+
+        predicted_idx = np.argmax(class_probs)
+        confidence = float(class_probs[predicted_idx])
+        predicted_label = self.class_labels[predicted_idx]
+
+        return predicted_label, confidence
 
     def reinitialize_hardware(self):
         if self.ser and hasattr(self.ser, 'is_open') and self.ser.is_open:
@@ -297,43 +389,66 @@ class SensorAcquisitionWorker:
                 return False, f"⚠️ PARTIAL / SIMULATION MODE:\n{str(e)}"
         return True, "💻 SIMULATION MODE ACTIVE"
 
-    def trigger_emergency_stop(self, reason="Manual/Overshoot"):
-        """Instant safety lockout: releases motor lock and stops sequence."""
-        self.e_stop_triggered = True
-        self.e_stop_reason = reason
-        self.current_movement_label = "EMERGENCY_STOP"
-        if CAN_AVAILABLE and self.can_mgr:
-            self.can_mgr.emergency_release_all()
-        print(f"🚨 EMERGENCY STOP TRIGGERED: {reason}")
+    def calibrate_imu_bias(self, samples=30):
+        if not I2C_AVAILABLE or not self.hardware_initialized:
+            return
+        ax_s = ay_s = az_s = gx_s = gy_s = gz_s = 0.0
+        valid = 0
+        for _ in range(samples):
+            try:
+                s = self.imu.get_sensor_data()
+                ax_s += s['accel']['x']; ay_s += s['accel']['y']; az_s += s['accel']['z']
+                gx_s += s['gyro']['x']; gy_s += s['gyro']['y']; gz_s += s['gyro']['z']
+                valid += 1
+                time.sleep(0.005)
+            except Exception: pass
+        if valid > 0:
+            self.ax_off = ax_s / valid
+            self.ay_off = ay_s / valid
+            self.az_off = (az_s / valid) - 1.0
+            self.gx_off = gx_s / valid
+            self.gy_off = gy_s / valid
+            self.gz_off = gz_s / valid
 
-    def reset_emergency_stop(self):
-        self.e_stop_triggered = False
-        self.e_stop_reason = ""
-        self.current_movement_label = "IDLE"
-        if CAN_AVAILABLE and self.can_mgr:
-            self.can_mgr.set_origin_all()
-
-    # --- SMART ASSIST-AS-NEEDED (AAN) CONTROL PROTOCOL ---
-    def trigger_smart_aan_protocol(self, movement_type: str, speed_mode: str, on_complete_callback=None):
+    def start_test_stream(self):
         if self.movement_thread and self.movement_thread.is_alive():
             return False, "Movement protocol in progress!"
-        if self.e_stop_triggered:
-            return False, "Clear Emergency Stop first!"
+        self.calibrate_imu_bias()
+        self.current_movement_label = "SENSOR_TEST"
+        self.is_streaming = True
+        return True, "Test Stream Started"
+
+    def stop_test_stream(self):
+        self.is_streaming = False
+        self.current_movement_label = "IDLE"
+        return True, "Test Stream Stopped"
+
+    def _trigger_internal_overangle_stop(self, reason: str):
+        self.e_stop_triggered = True
+        self.e_stop_reason = reason
+        self.current_movement_label = "SAFETY_CUTOFF_OVERSHOOT"
+        if CAN_AVAILABLE and self.can_mgr:
+            self.can_mgr.emergency_release_all()
+        print(f"🚨 AUTOMATIC OVER-ANGLE GUARD TRIGGERED: {reason}")
+
+    def auto_trigger_smart_aan(self, detected_gesture: str, speed_mode='Slow'):
+        if self.movement_thread and self.movement_thread.is_alive():
+            return
+
+        self.e_stop_triggered = False
+        self.e_stop_reason = ""
 
         self.movement_thread = threading.Thread(
             target=self._run_smart_aan_fsm, 
-            args=(movement_type, speed_mode, on_complete_callback),
+            args=(detected_gesture.lower(), speed_mode, None),
             daemon=True
         )
         self.movement_thread.start()
-        return True, f"Started Smart AAN: {movement_type}"
 
     def _run_smart_aan_fsm(self, movement_type: str, speed_mode: str, on_complete_callback=None):
-        self.is_streaming = True
-        self.current_movement_label = "INITIALIZING"
-        time.sleep(1.0)
+        self.current_movement_label = f"DETECTED:{movement_type.upper()}"
+        time.sleep(0.5)
 
-        # Target Speed Configuration
         is_medium = (speed_mode.lower() == "medium")
         spd_1_2 = 3000.0; acc_1_2 = 1000.0
         spd_11_12 = 1000.0 if is_medium else 300.0
@@ -356,9 +471,6 @@ class SensorAcquisitionWorker:
                 (12, 0.0, spd_11_12, acc_11_12)
             ]
 
-        # ----------------------------------------------------------------------
-        # PHASE 1: PATIENT TRYING (5-SECOND MONITORING WINDOW)
-        # ----------------------------------------------------------------------
         start_time = time.time()
         patient_reached = False
         
@@ -368,7 +480,6 @@ class SensorAcquisitionWorker:
             remaining_sec = round(5.0 - (time.time() - start_time), 1)
             self.current_movement_label = f"TRYING_{movement_type.upper()}_{remaining_sec}S"
 
-            # Check if patient reaches target independently
             reached_all = True
             for cid, target_angle, _, _ in targets:
                 cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
@@ -385,59 +496,82 @@ class SensorAcquisitionWorker:
         if patient_reached:
             self.current_movement_label = "PATIENT_SUCCESS"
             time.sleep(1.0)
-            self.is_streaming = False
-            self.current_movement_label = "IDLE"
+            self.current_movement_label = "LSTM_MONITORING" if self.auto_lstm_enabled else "IDLE"
             if on_complete_callback: on_complete_callback()
             return
 
-        # ----------------------------------------------------------------------
-        # PHASE 2: MOTOR ASSIST (STUCK FOR 5 SECONDS -> ACTUATE)
-        # ----------------------------------------------------------------------
         self.current_movement_label = f"ASSISTING_{movement_type.upper()}"
         for cid, pos, spd, acc in targets:
             self.can_mgr.set_move(cid, pos, spd, acc)
             time.sleep(0.005)
 
-        # Monitor move and execute real-time E-Stop over-angle guard
         assist_start = time.time()
         while time.time() - assist_start < 4.0:
             if self.e_stop_triggered: return
 
-            # REAL-TIME E-STOP OVER-ANGLE GUARD
             for cid, target_angle, _, _ in targets:
                 cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
                 max_allowable_limit = abs(target_angle) + self.safety_overshoot_margin_deg
                 
                 if abs(cur_pos) > max_allowable_limit:
-                    self.trigger_emergency_stop(f"Motor {cid} overshot limit ({cur_pos:.1f}° > {max_allowable_limit:.1f}°)")
+                    self._trigger_internal_overangle_stop(
+                        f"Motor {cid} position ({cur_pos:.1f}°) exceeded target limit ({max_allowable_limit:.1f}°)"
+                    )
                     return
 
-            time.sleep(0.02)
+            time.sleep(0.01)
 
-        # ----------------------------------------------------------------------
-        # PHASE 3: HOLD TARGET POSITION FOR 15 SECONDS
-        # ----------------------------------------------------------------------
         for sec_left in range(15, 0, -1):
             if self.e_stop_triggered: return
+            
+            for cid, target_angle, _, _ in targets:
+                cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
+                if abs(cur_pos) > (abs(target_angle) + self.safety_overshoot_margin_deg):
+                    self._trigger_internal_overangle_stop(f"Motor {cid} drift exceeded limit during hold")
+                    return
+
             self.current_movement_label = f"ASSIST_HOLD_{sec_left}S"
             time.sleep(1.0)
 
-        # ----------------------------------------------------------------------
-        # PHASE 4: RETURN TO NEUTRAL (0°) & STOP PROGRAM
-        # ----------------------------------------------------------------------
         self.current_movement_label = "RETURNING_NEUTRAL"
         for cid, _, spd, acc in targets:
             self.can_mgr.set_move(cid, 0.0, spd, acc)
             time.sleep(0.005)
 
         time.sleep(2.0)
-        self.is_streaming = False
-        self.current_movement_label = "IDLE"
+        self.current_movement_label = "LSTM_MONITORING" if self.auto_lstm_enabled else "IDLE"
 
         if on_complete_callback:
             on_complete_callback()
 
-    # --- SENSOR SAMPLING LOOP ---
+    def voltage_to_percentage(self, volts, v_min, v_max):
+        if volts <= v_min: return 0.0
+        if volts >= v_max: return 100.0
+        return round(((volts - v_min) / (v_max - v_min)) * 100.0, 1)
+
+    def read_serial_emg(self):
+        if not self.ser or not hasattr(self.ser, 'is_open') or not self.ser.is_open:
+            return self.last_emg
+        try:
+            latest_line = None
+            while self.ser.in_waiting > 0:
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if line and not line.startswith('#'):
+                    latest_line = line
+            if latest_line:
+                parts = latest_line.split(',')
+                if len(parts) == 3:
+                    raw_f = int(parts[1])
+                    raw_e = int(parts[2])
+                    self.last_emg = [raw_f if raw_f >= 25 else 0, raw_e if raw_e >= 25 else 0]
+        except Exception: pass
+        return self.last_emg
+
+    def read_voltage(self, analog_channel_object):
+        if not I2C_AVAILABLE or not self.hardware_initialized: return 0.0
+        try: return analog_channel_object.voltage
+        except Exception: return 0.0
+
     def main_loop(self):
         self.initialize_hardware_inside_thread()
         target_sample_rate = 100    
@@ -479,6 +613,15 @@ class SensorAcquisitionWorker:
                     ax, ay, az = [round(random.uniform(-0.8, 0.8), 2) for _ in range(3)]
                     gx, gy, gz = [round(random.uniform(-120.0, 120.0), 1) for _ in range(3)]
                     emg1 = random.randint(100, 400); emg2 = random.randint(100, 350)
+
+                self.raw_emg_buffer_f.append(emg1)
+                self.raw_emg_buffer_e.append(emg2)
+
+                if self.auto_lstm_enabled and (self.movement_thread is None or not self.movement_thread.is_alive()):
+                    pred_class, confidence = self.run_inference_step([f1, f2, f3, f4, f5], [ax, ay, az], [gx, gy, gz])
+                    if pred_class and confidence >= 0.80:
+                        print(f"🎯 MODEL DETECTED: {pred_class} ({confidence*100:.1f}%) -> Auto-Starting AAN")
+                        self.auto_trigger_smart_aan(pred_class)
 
                 m1_pos, m1_spd, m1_acc = self.can_mgr.get_motor_state_data(1)
                 m2_pos, m2_spd, m2_acc = self.can_mgr.get_motor_state_data(2)
