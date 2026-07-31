@@ -215,7 +215,7 @@ class CubeMarsCANManager:
 
 
 class SensorAcquisitionWorker:
-    def __init__(self, data_queue, model_path="multiLSTM-LOSO.keras"):
+    def __init__(self, data_queue, model_path="model_86pc.keras"):
         self.data_queue = data_queue
         self.running = True
         self.is_streaming = False
@@ -242,6 +242,7 @@ class SensorAcquisitionWorker:
         self.current_movement_label = "IDLE"
         self.movement_thread = None
 
+        # --- MODEL & AUTO CONTROL SETTINGS ---
         self.auto_lstm_enabled = False
         self.model_path = model_path
         self.model = None
@@ -251,200 +252,17 @@ class SensorAcquisitionWorker:
         self.raw_emg_buffer_e = deque(maxlen=30)
         self.sequence_tensor_buffer = deque(maxlen=6)
 
+        # SAFEGUARDS AGAINST INFINITE LOOPING
+        self.cooldown_until = 0.0          # Refractory timer
+        self.emg_activation_threshold = 40.0 # Baseline RMS noise cutoff (adjust if needed)
+
         self.e_stop_triggered = False
         self.e_stop_reason = ""
         self.safety_overshoot_margin_deg = 5.0
 
         self.init_tf_model()
 
-    def init_tf_model(self):
-        if os.path.exists(self.model_path):
-            try:
-                self.model = tf.keras.models.load_model(self.model_path)
-                print(f"🧠 TensorFlow Model '{self.model_path}' loaded successfully!")
-            except Exception as e:
-                print(f"⚠️ Error loading Keras model: {e}")
-        else:
-            print(f"⚠️ Model file '{self.model_path}' not found in directory.")
-
-    def toggle_auto_lstm_control(self, enable: bool):
-        self.auto_lstm_enabled = enable
-        if enable:
-            self.calibrate_imu_bias()
-            self.current_movement_label = "LSTM_MONITORING"
-            self.is_streaming = True
-        else:
-            self.auto_lstm_enabled = False
-            self.is_streaming = False
-            self.current_movement_label = "IDLE"
-
-    def extract_td_features(self, w_flex, w_ext, eps=1e-6):
-        """Extracts 13 Time-Domain sEMG features matching model_86pc.keras input shape."""
-        w_f, w_e = np.array(w_flex), np.array(w_ext)
-        
-        rms_f, rms_e = np.sqrt(np.mean(w_f**2)), np.sqrt(np.mean(w_e**2))
-        mav_f, mav_e = np.mean(np.abs(w_f)), np.mean(np.abs(w_e))
-        wl_f, wl_e = np.sum(np.abs(np.diff(w_f))), np.sum(np.abs(np.diff(w_e)))
-        zc_f = np.sum((w_f[:-1] * w_f[1:] < 0))
-        zc_e = np.sum((w_e[:-1] * w_e[1:] < 0))
-        var_f, var_e = np.var(w_f), np.var(w_e)
-        ssc_f = np.sum(np.diff(np.sign(np.diff(w_f))) != 0)
-        ssc_e = np.sum(np.diff(np.sign(np.diff(w_e))) != 0)
-        
-        # Cross-channel Log-RMS Ratio
-        log_ratio = np.log((rms_f + eps) / (rms_e + eps))
-        
-        # Total = 13 features
-        return [
-            rms_f, rms_e, 
-            mav_f, mav_e, 
-            wl_f, wl_e, 
-            zc_f, zc_e, 
-            var_f, var_e, 
-            ssc_f, ssc_e, 
-            log_ratio
-        ]
-
-    def run_inference_step(self, flex_data, imu_acc, imu_gyr):
-        if len(self.raw_emg_buffer_f) < 30 or self.model is None:
-            return None, 0.0
-
-        # Extract 13 sEMG TD + 5 Flex + 6 IMU = 24 features
-        td = self.extract_td_features(self.raw_emg_buffer_f, self.raw_emg_buffer_e)
-        frame_features = td + flex_data + imu_acc + imu_gyr
-        self.sequence_tensor_buffer.append(frame_features)
-
-        if len(self.sequence_tensor_buffer) < 6:
-            return None, 0.0
-
-        # Construct shape (1, 6, 24) tensor
-        input_data = np.array(self.sequence_tensor_buffer, dtype=np.float32)
-        
-        # Ensure feature dimension strictly matches model expectation
-        expected_features = self.model.input_shape[-1]  # Automatically reads 24
-        if input_data.shape[-1] > expected_features:
-            input_data = input_data[:, :expected_features]
-            
-        input_data = np.expand_dims(input_data, axis=0)
-
-        # Execute Keras inference
-        outputs = self.model(input_data, training=False)
-        
-        if isinstance(outputs, list):
-            class_probs = outputs[0].numpy()[0]
-        else:
-            class_probs = outputs.numpy()[0]
-
-        predicted_idx = np.argmax(class_probs)
-        confidence = float(class_probs[predicted_idx])
-        predicted_label = self.class_labels[predicted_idx]
-
-        return predicted_label, confidence
-
-    def reinitialize_hardware(self):
-        if self.ser and hasattr(self.ser, 'is_open') and self.ser.is_open:
-            try: self.ser.close()
-            except Exception: pass
-        self.ser = None
-        self.can_mgr.stop()
-        self.hardware_initialized = False
-        self.e_stop_triggered = False
-        return self.initialize_hardware_inside_thread()
-
-    def initialize_hardware_inside_thread(self):
-        if not self.hardware_initialized:
-            try:
-                if I2C_AVAILABLE:
-                    self.i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
-                    self.ads1 = ADS.ADS1115(self.i2c, address=self.ADC1_ADDR)
-                    self.ads1.gain = 1; self.ads1.data_rate = 860
-                    self.ch_f1 = AnalogIn(self.ads1, 0)
-                    self.ch_f2 = AnalogIn(self.ads1, 1)
-                    self.ch_f3 = AnalogIn(self.ads1, 2)
-                    self.ch_f4 = AnalogIn(self.ads1, 3)
-
-                    self.ads2 = ADS.ADS1115(self.i2c, address=self.ADC2_ADDR)
-                    self.ads2.gain = 1; self.ads2.data_rate = 860
-                    self.ch_f5 = AnalogIn(self.ads2, 0)
-
-                    self.imu = DFRobot_ICG20660L_IIC(addr=DFRobot_ICG20660L_IIC.IIC_ADDR_SDO_H)
-                    while self.imu.begin(self.imu.eREG_MODE) != 0: time.sleep(0.5)
-                    self.imu.enable_sensor(bit=self.imu.eAXIS_ALL)
-                    self.imu.config_gyro(scale=self.imu.eFSR_G_500DPS, bd=self.imu.eGYRO_DLPF_176_1KHZ)
-                    self.imu.config_accel(scale=self.imu.eFSR_A_16G, bd=self.imu.eACCEL_DLPF_218_1KHZ)
-                    self.imu.set_sample_div(div=19)
-
-                if SERIAL_AVAILABLE:
-                    self.ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=0.005)
-                    self.ser.reset_input_buffer()
-
-                if CAN_AVAILABLE:
-                    if self.can_mgr.init_can('can0', 1000000):
-                        self.can_mgr.start()
-                        self.can_mgr.set_origin_all()
-
-                self.hardware_initialized = True
-                return True, "✅ ALL HARDWARE PIPELINES ONLINE"
-            except Exception as e:
-                return False, f"⚠️ PARTIAL / SIMULATION MODE:\n{str(e)}"
-        return True, "💻 SIMULATION MODE ACTIVE"
-
-    def calibrate_imu_bias(self, samples=30):
-        if not I2C_AVAILABLE or not self.hardware_initialized:
-            return
-        ax_s = ay_s = az_s = gx_s = gy_s = gz_s = 0.0
-        valid = 0
-        for _ in range(samples):
-            try:
-                s = self.imu.get_sensor_data()
-                ax_s += s['accel']['x']; ay_s += s['accel']['y']; az_s += s['accel']['z']
-                gx_s += s['gyro']['x']; gy_s += s['gyro']['y']; gz_s += s['gyro']['z']
-                valid += 1
-                time.sleep(0.005)
-            except Exception: pass
-        if valid > 0:
-            self.ax_off = ax_s / valid
-            self.ay_off = ay_s / valid
-            self.az_off = (az_s / valid) - 1.0
-            self.gx_off = gx_s / valid
-            self.gy_off = gy_s / valid
-            self.gz_off = gz_s / valid
-
-    def start_test_stream(self):
-        if self.movement_thread and self.movement_thread.is_alive():
-            return False, "Movement protocol in progress!"
-        self.calibrate_imu_bias()
-        self.current_movement_label = "SENSOR_TEST"
-        self.is_streaming = True
-        return True, "Test Stream Started"
-
-    def stop_test_stream(self):
-        self.is_streaming = False
-        self.current_movement_label = "IDLE"
-        return True, "Test Stream Stopped"
-
-    def _trigger_internal_overangle_stop(self, reason: str):
-        self.e_stop_triggered = True
-        self.e_stop_reason = reason
-        self.current_movement_label = "SAFETY_CUTOFF_OVERSHOOT"
-        if CAN_AVAILABLE and self.can_mgr:
-            self.can_mgr.emergency_release_all()
-        print(f"🚨 AUTOMATIC OVER-ANGLE GUARD TRIGGERED: {reason}")
-
-    def auto_trigger_smart_aan(self, detected_gesture: str, speed_mode='Slow'):
-        if self.movement_thread and self.movement_thread.is_alive():
-            return
-
-        self.e_stop_triggered = False
-        self.e_stop_reason = ""
-
-        self.movement_thread = threading.Thread(
-            target=self._run_smart_aan_fsm, 
-            args=(detected_gesture.lower(), speed_mode, None),
-            daemon=True
-        )
-        self.movement_thread.start()
-
+    # --- UPDATED SMART AAN PROTOCOL WITH COOLDOWN & FLUSH ---
     def _run_smart_aan_fsm(self, movement_type: str, speed_mode: str, on_complete_callback=None):
         self.current_movement_label = f"DETECTED:{movement_type.upper()}"
         time.sleep(0.5)
@@ -471,6 +289,7 @@ class SensorAcquisitionWorker:
                 (12, 0.0, spd_11_12, acc_11_12)
             ]
 
+        # PHASE 1: PATIENT TRYING (5s WINDOW)
         start_time = time.time()
         patient_reached = False
         
@@ -496,10 +315,10 @@ class SensorAcquisitionWorker:
         if patient_reached:
             self.current_movement_label = "PATIENT_SUCCESS"
             time.sleep(1.0)
-            self.current_movement_label = "LSTM_MONITORING" if self.auto_lstm_enabled else "IDLE"
-            if on_complete_callback: on_complete_callback()
+            self._finish_and_set_cooldown()
             return
 
+        # PHASE 2: MOTOR ASSIST WITH OVER-ANGLE GUARD
         self.current_movement_label = f"ASSISTING_{movement_type.upper()}"
         for cid, pos, spd, acc in targets:
             self.can_mgr.set_move(cid, pos, spd, acc)
@@ -521,6 +340,7 @@ class SensorAcquisitionWorker:
 
             time.sleep(0.01)
 
+        # PHASE 3: HOLD TARGET POSITION FOR 15 SECONDS
         for sec_left in range(15, 0, -1):
             if self.e_stop_triggered: return
             
@@ -533,45 +353,24 @@ class SensorAcquisitionWorker:
             self.current_movement_label = f"ASSIST_HOLD_{sec_left}S"
             time.sleep(1.0)
 
+        # PHASE 4: RETURN TO NEUTRAL (0°)
         self.current_movement_label = "RETURNING_NEUTRAL"
         for cid, _, spd, acc in targets:
             self.can_mgr.set_move(cid, 0.0, spd, acc)
             time.sleep(0.005)
 
         time.sleep(2.0)
+        self._finish_and_set_cooldown()
+
+    def _finish_and_set_cooldown(self):
+        """Flushes buffers and activates 3.0 second refractory period."""
+        self.raw_emg_buffer_f.clear()
+        self.raw_emg_buffer_e.clear()
+        self.sequence_tensor_buffer.clear()
+        self.cooldown_until = time.time() + 3.0  # 3-Second Cooldown
         self.current_movement_label = "LSTM_MONITORING" if self.auto_lstm_enabled else "IDLE"
 
-        if on_complete_callback:
-            on_complete_callback()
-
-    def voltage_to_percentage(self, volts, v_min, v_max):
-        if volts <= v_min: return 0.0
-        if volts >= v_max: return 100.0
-        return round(((volts - v_min) / (v_max - v_min)) * 100.0, 1)
-
-    def read_serial_emg(self):
-        if not self.ser or not hasattr(self.ser, 'is_open') or not self.ser.is_open:
-            return self.last_emg
-        try:
-            latest_line = None
-            while self.ser.in_waiting > 0:
-                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                if line and not line.startswith('#'):
-                    latest_line = line
-            if latest_line:
-                parts = latest_line.split(',')
-                if len(parts) == 3:
-                    raw_f = int(parts[1])
-                    raw_e = int(parts[2])
-                    self.last_emg = [raw_f if raw_f >= 25 else 0, raw_e if raw_e >= 25 else 0]
-        except Exception: pass
-        return self.last_emg
-
-    def read_voltage(self, analog_channel_object):
-        if not I2C_AVAILABLE or not self.hardware_initialized: return 0.0
-        try: return analog_channel_object.voltage
-        except Exception: return 0.0
-
+    # --- UPDATED MAIN LOOP WITH AMPLITUDE & COOLDOWN CHECKS ---
     def main_loop(self):
         self.initialize_hardware_inside_thread()
         target_sample_rate = 100    
@@ -617,11 +416,20 @@ class SensorAcquisitionWorker:
                 self.raw_emg_buffer_f.append(emg1)
                 self.raw_emg_buffer_e.append(emg2)
 
-                if self.auto_lstm_enabled and (self.movement_thread is None or not self.movement_thread.is_alive()):
-                    pred_class, confidence = self.run_inference_step([f1, f2, f3, f4, f5], [ax, ay, az], [gx, gy, gz])
-                    if pred_class and confidence >= 0.80:
-                        print(f"🎯 MODEL DETECTED: {pred_class} ({confidence*100:.1f}%) -> Auto-Starting AAN")
-                        self.auto_trigger_smart_aan(pred_class)
+                now = time.time()
+                # RUN INFERENCE ONLY IF OUTSIDE COOLDOWN & MUSCLE IS ACTUALLY ACTIVATED
+                if self.auto_lstm_enabled and (self.movement_thread is None or not self.movement_thread.is_alive()) and now > self.cooldown_until:
+                    
+                    # Calculate live sEMG RMS amplitude
+                    rms_f = np.sqrt(np.mean(np.array(self.raw_emg_buffer_f)**2)) if len(self.raw_emg_buffer_f) >= 30 else 0
+                    rms_e = np.sqrt(np.mean(np.array(self.raw_emg_buffer_e)**2)) if len(self.raw_emg_buffer_e) >= 30 else 0
+                    
+                    # AMPLITUDE GUARD: Muscle must exceed resting threshold to trigger model
+                    if (rms_f > self.emg_activation_threshold or rms_e > self.emg_activation_threshold):
+                        pred_class, confidence = self.run_inference_step([f1, f2, f3, f4, f5], [ax, ay, az], [gx, gy, gz])
+                        if pred_class and confidence >= 0.80:
+                            print(f"🎯 MODEL DETECTED: {pred_class} ({confidence*100:.1f}%) -> Auto-Starting AAN")
+                            self.auto_trigger_smart_aan(pred_class)
 
                 m1_pos, m1_spd, m1_acc = self.can_mgr.get_motor_state_data(1)
                 m2_pos, m2_spd, m2_acc = self.can_mgr.get_motor_state_data(2)
