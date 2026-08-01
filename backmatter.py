@@ -8,10 +8,8 @@ from enum import IntEnum
 import numpy as np
 from collections import deque
 
-# --- TENSORFLOW IMPORT ---
 import tensorflow as tf
 
-# --- HARDWARE INTEGRATION GUARDS ---
 try:
     import board
     import busio
@@ -147,7 +145,7 @@ class CubeMarsCANManager:
                 pass
 
     def emergency_release_all(self):
-        """Immediately unlocks motors to zero torque."""
+        """Unlocks all motors back to unpowered zero torque / free movement."""
         with self.bus_lock:
             for cid in self.controller_ids:
                 self.motor_states[cid]["state"] = "UNLOCKED"
@@ -211,20 +209,21 @@ class CubeMarsCANManager:
                 time.sleep(0.005)
 
     def get_motor_state_data(self, cid: int) -> tuple[float, float, float]:
+        """Returns tuple of (actual_position_deg, actual_speed_erpm, target_position_deg)."""
         with self.bus_lock:
             st = self.motor_states.get(cid, {})
             telem = self.telemetry.get(cid, {})
             pos = telem.get("position_deg", 0.0)
             spd = telem.get("speed_erpm", 0.0)
-            acc = st.get("accel", 0.0)
-            return pos, spd, acc
+            target_pos = st.get("target_pos", 0.0)
+            return pos, spd, target_pos
 
 
 # ==============================================================================
 # SENSOR ACQUISITION WORKER WITH TENSORFLOW MODEL
 # ==============================================================================
 class SensorAcquisitionWorker:
-    def __init__(self, data_queue, model_path="multiLSTM-LOSO.keras"):
+    def __init__(self, data_queue, model_path="model_86pc.keras"):
         self.data_queue = data_queue
         self.running = True
         self.is_streaming = False
@@ -261,9 +260,10 @@ class SensorAcquisitionWorker:
         self.raw_emg_buffer_e = deque(maxlen=30)
         self.sequence_tensor_buffer = deque(maxlen=6)
 
-        # SAFEGUARDS AGAINST INFINITE LOOPING
-        self.cooldown_until = 0.0             # Refractory timer
+        # TUNABLE INFERENCE & SAFETY HYPERPARAMETERS
+        self.confidence_threshold = 0.65       # Adjusted from 0.80 for better responsiveness
         self.emg_activation_threshold = 40.0   # Baseline RMS activation threshold
+        self.cooldown_until = 0.0             # Refractory timer
 
         self.e_stop_triggered = False
         self.e_stop_reason = ""
@@ -292,6 +292,8 @@ class SensorAcquisitionWorker:
             self.auto_lstm_enabled = False
             self.is_streaming = False
             self.current_movement_label = "IDLE"
+            if CAN_AVAILABLE and self.can_mgr:
+                self.can_mgr.emergency_release_all()
 
     def extract_td_features(self, w_flex, w_ext, eps=1e-6):
         """Extracts 13 Time-Domain sEMG features matching model shape."""
@@ -320,7 +322,6 @@ class SensorAcquisitionWorker:
         if len(self.raw_emg_buffer_f) < 30 or self.model is None:
             return None, 0.0
 
-        # Extract 13 sEMG TD + 5 Flex + 6 IMU = 24 features
         td = self.extract_td_features(self.raw_emg_buffer_f, self.raw_emg_buffer_e)
         frame_features = td + flex_data + imu_acc + imu_gyr
         self.sequence_tensor_buffer.append(frame_features)
@@ -328,10 +329,8 @@ class SensorAcquisitionWorker:
         if len(self.sequence_tensor_buffer) < 6:
             return None, 0.0
 
-        # Construct shape (1, 6, 24) tensor
         input_data = np.array(self.sequence_tensor_buffer, dtype=np.float32)
         
-        # Dynamic slicing safety check
         if hasattr(self.model, 'input_shape') and self.model.input_shape:
             expected_features = self.model.input_shape[-1]
             if expected_features and input_data.shape[-1] > expected_features:
@@ -339,7 +338,6 @@ class SensorAcquisitionWorker:
 
         input_data = np.expand_dims(input_data, axis=0)
 
-        # Execute direct Keras forward pass
         outputs = self.model(input_data, training=False)
         
         if isinstance(outputs, list):
@@ -353,7 +351,6 @@ class SensorAcquisitionWorker:
 
         return predicted_label, confidence
 
-    # --- HARDWARE INITIALIZATION ---
     def reinitialize_hardware(self):
         if self.ser and hasattr(self.ser, 'is_open') and self.ser.is_open:
             try: self.ser.close()
@@ -434,6 +431,8 @@ class SensorAcquisitionWorker:
     def stop_test_stream(self):
         self.is_streaming = False
         self.current_movement_label = "IDLE"
+        if CAN_AVAILABLE and self.can_mgr:
+            self.can_mgr.emergency_release_all()
         return True, "Test Stream Stopped"
 
     def _trigger_internal_overangle_stop(self, reason: str):
@@ -489,7 +488,9 @@ class SensorAcquisitionWorker:
         patient_reached = False
         
         while time.time() - start_time < 5.0:
-            if self.e_stop_triggered: return
+            if self.e_stop_triggered: 
+                self._finish_and_set_cooldown()
+                return
 
             remaining_sec = round(5.0 - (time.time() - start_time), 1)
             self.current_movement_label = f"TRYING_{movement_type.upper()}_{remaining_sec}S"
@@ -521,7 +522,9 @@ class SensorAcquisitionWorker:
 
         assist_start = time.time()
         while time.time() - assist_start < 4.0:
-            if self.e_stop_triggered: return
+            if self.e_stop_triggered: 
+                self._finish_and_set_cooldown()
+                return
 
             for cid, target_angle, _, _ in targets:
                 cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
@@ -531,18 +534,22 @@ class SensorAcquisitionWorker:
                     self._trigger_internal_overangle_stop(
                         f"Motor {cid} position ({cur_pos:.1f}°) exceeded target limit ({max_allowable_limit:.1f}°)"
                     )
+                    self._finish_and_set_cooldown()
                     return
 
             time.sleep(0.01)
 
         # PHASE 3: HOLD TARGET POSITION FOR 15 SECONDS
         for sec_left in range(15, 0, -1):
-            if self.e_stop_triggered: return
+            if self.e_stop_triggered: 
+                self._finish_and_set_cooldown()
+                return
             
             for cid, target_angle, _, _ in targets:
                 cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
                 if abs(cur_pos) > (abs(target_angle) + self.safety_overshoot_margin_deg):
                     self._trigger_internal_overangle_stop(f"Motor {cid} drift exceeded limit during hold")
+                    self._finish_and_set_cooldown()
                     return
 
             self.current_movement_label = f"ASSIST_HOLD_{sec_left}S"
@@ -558,7 +565,10 @@ class SensorAcquisitionWorker:
         self._finish_and_set_cooldown()
 
     def _finish_and_set_cooldown(self):
-        """Flushes buffers and activates 3.0s refractory cooldown period."""
+        """Flushes buffers, unlocks motor torque to zero, and activates 3.0s cooldown."""
+        if CAN_AVAILABLE and self.can_mgr:
+            self.can_mgr.emergency_release_all()  # <--- AUTOMATIC UNLOCK AFTER MOVEMENT
+            
         self.raw_emg_buffer_f.clear()
         self.raw_emg_buffer_e.clear()
         self.sequence_tensor_buffer.clear()
@@ -639,21 +649,20 @@ class SensorAcquisitionWorker:
                 self.raw_emg_buffer_e.append(emg2)
 
                 now = time.time()
-                # RUN INFERENCE ONLY IF OUTSIDE COOLDOWN & MUSCLE ACTIVATED
                 if self.auto_lstm_enabled and (self.movement_thread is None or not self.movement_thread.is_alive()) and now > self.cooldown_until:
                     rms_f = np.sqrt(np.mean(np.array(self.raw_emg_buffer_f)**2)) if len(self.raw_emg_buffer_f) >= 30 else 0
                     rms_e = np.sqrt(np.mean(np.array(self.raw_emg_buffer_e)**2)) if len(self.raw_emg_buffer_e) >= 30 else 0
                     
                     if (rms_f > self.emg_activation_threshold or rms_e > self.emg_activation_threshold):
                         pred_class, confidence = self.run_inference_step([f1, f2, f3, f4, f5], [ax, ay, az], [gx, gy, gz])
-                        if pred_class and confidence >= 0.60:
+                        if pred_class and confidence >= self.confidence_threshold:
                             print(f"🎯 MODEL DETECTED: {pred_class} ({confidence*100:.1f}%) -> Auto-Starting AAN")
                             self.auto_trigger_smart_aan(pred_class)
 
-                m1_pos, m1_spd, m1_acc = self.can_mgr.get_motor_state_data(1)
-                m2_pos, m2_spd, m2_acc = self.can_mgr.get_motor_state_data(2)
-                m11_pos, m11_spd, m11_acc = self.can_mgr.get_motor_state_data(11)
-                m12_pos, m12_spd, m12_acc = self.can_mgr.get_motor_state_data(12)
+                m1_pos, m1_spd, m1_tgt = self.can_mgr.get_motor_state_data(1)
+                m2_pos, m2_spd, m2_tgt = self.can_mgr.get_motor_state_data(2)
+                m11_pos, m11_spd, m11_tgt = self.can_mgr.get_motor_state_data(11)
+                m12_pos, m12_spd, m12_tgt = self.can_mgr.get_motor_state_data(12)
 
                 telemetry_frame = {
                     'movement_label': self.current_movement_label,
@@ -661,10 +670,10 @@ class SensorAcquisitionWorker:
                     'emg': [emg1, emg2],
                     'accel': [ax, ay, az],
                     'gyro': [gx, gy, gz],
-                    'm1': [m1_pos, m1_spd, m1_acc],
-                    'm2': [m2_pos, m2_spd, m2_acc],
-                    'm11': [m11_pos, m11_spd, m11_acc],
-                    'm12': [m12_pos, m12_spd, m12_acc]
+                    'm1': [m1_pos, m1_spd, m1_tgt],
+                    'm2': [m2_pos, m2_spd, m2_tgt],
+                    'm11': [m11_pos, m11_spd, m11_tgt],
+                    'm12': [m12_pos, m12_spd, m12_tgt]
                 }
                 self.data_queue.put(telemetry_frame)
                 next_sample_time += sample_interval

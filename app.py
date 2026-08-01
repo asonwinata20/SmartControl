@@ -150,8 +150,9 @@ class TelemetryDashboard(App):
         self.lbl_emg_data = Label(text="EMG PROFILES:\nFLEXOR: --\nEXTENSOR: --", font_size='10sp', bold=True, halign='left', valign='middle', color=(1.0, 0.4, 1.0, 1))
         self.lbl_motion_data = Label(text="6-AXIS IMU METRICS:\nACC: X:--g | Y:--g | Z:--g\nGYR: X:--dps | Y:--dps | Z:--dps", font_size='10sp', bold=True, halign='left', valign='middle', color=(0.0, 0.8, 1.0, 1))
         
+        # DISPLAY BOTH LIVE DEGREE AND TARGET DEGREE
         self.lbl_motor_data = Label(
-            text="CUBEMARS MOTOR TELEMETRY:\nM1: --° (-- eRPM) | M2: --° (-- eRPM)\nM11: --° (-- eRPM) | M12: --° (-- eRPM)", 
+            text="CUBEMARS MOTOR TELEMETRY:\nM1: --° / Tgt: --° (-- eRPM) | M2: --° / Tgt: --° (-- eRPM)\nM11: --° / Tgt: --° (-- eRPM) | M12: --° / Tgt: --° (-- eRPM)", 
             font_size='10sp', bold=True, halign='left', valign='middle', color=(1.0, 0.8, 0.2, 1)
         )
 
@@ -165,7 +166,7 @@ class TelemetryDashboard(App):
         return root_layout
 
     def on_start(self):
-        self.worker = SensorAcquisitionWorker(self.telemetry_queue, model_path="multiLSTM-LOSO.keras")
+        self.worker = SensorAcquisitionWorker(self.telemetry_queue, model_path="model_86pc.keras")
         self.worker_thread = threading.Thread(target=self.worker.main_loop)
         self.worker_thread.daemon = True
         self.worker_thread.start()
@@ -242,8 +243,8 @@ class TelemetryDashboard(App):
         )
         self.lbl_motor_data.text = (
             "CUBEMARS MOTOR TELEMETRY:\n"
-            "M1: 0.0° (0 eRPM) | M2: 0.0° (0 eRPM)\n"
-            "M11: 0.0° (0 eRPM) | M12: 0.0° (0 eRPM)"
+            "M1: 0.0° / Tgt: 0.0° (0 eRPM) | M2: 0.0° / Tgt: 0.0° (0 eRPM)\n"
+            "M11: 0.0° / Tgt: 0.0° (0 eRPM) | M12: 0.0° / Tgt: 0.0° (0 eRPM)"
         )
         self.redraw_grid_waveforms()
 
@@ -261,10 +262,10 @@ class TelemetryDashboard(App):
                 latest_emg = frame['emg']
                 latest_a = frame['accel']
                 latest_g = frame['gyro']
-                latest_m1 = frame['m1']   # [pos, spd, acc]
-                latest_m2 = frame['m2']   # [pos, spd, acc]
-                latest_m11 = frame['m11'] # [pos, spd, acc]
-                latest_m12 = frame['m12'] # [pos, spd, acc]
+                latest_m1 = frame['m1']   # [actual_pos, actual_spd, target_pos]
+                latest_m2 = frame['m2']   # [actual_pos, actual_spd, target_pos]
+                latest_m11 = frame['m11'] # [actual_pos, actual_spd, target_pos]
+                latest_m12 = frame['m12'] # [actual_pos, actual_spd, target_pos]
 
                 for i in range(5): self.buffers[i].append(latest_f[i])
                 for i in range(2): self.buffers[5 + i].append(latest_emg[i])
@@ -287,8 +288,8 @@ class TelemetryDashboard(App):
             
             self.lbl_motor_data.text = (
                 f"CUBEMARS MOTOR TELEMETRY:\n"
-                f"M1: {latest_m1[0]:.1f}° ({latest_m1[1]:.0f} eRPM) | M2: {latest_m2[0]:.1f}° ({latest_m2[1]:.0f} eRPM)\n"
-                f"M11: {latest_m11[0]:.1f}° ({latest_m11[1]:.0f} eRPM) | M12: {latest_m12[0]:.1f}° ({latest_m12[1]:.0f} eRPM)"
+                f"M1: {latest_m1[0]:.1f}° / Tgt: {latest_m1[2]:.1f}° ({latest_m1[1]:.0f} eRPM) | M2: {latest_m2[0]:.1f}° / Tgt: {latest_m2[2]:.1f}° ({latest_m2[1]:.0f} eRPM)\n"
+                f"M11: {latest_m11[0]:.1f}° / Tgt: {latest_m11[2]:.1f}° ({latest_m11[1]:.0f} eRPM) | M12: {latest_m12[0]:.1f}° / Tgt: {latest_m12[2]:.1f}° ({latest_m12[1]:.0f} eRPM)"
             )
             self.redraw_grid_waveforms()
 
