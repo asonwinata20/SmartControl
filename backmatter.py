@@ -269,11 +269,11 @@ class SensorAcquisitionWorker:
 
         # LOSO MATRIX DERIVED THRESHOLDS
         self.class_thresholds = {
-            'Extension': 0.53,  
+            'Extension': 0.45,  
             'Flexion':   0.65,  
             'Grasping':  0.68,  
-            'Radial':    0.62,  
-            'Ulnar':     0.60
+            'Radial':    0.65,  
+            'Ulnar':     0.65
         }
 
         self.emg_activation_threshold = 30.0   
