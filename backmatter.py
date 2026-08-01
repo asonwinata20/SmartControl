@@ -223,7 +223,7 @@ class CubeMarsCANManager:
 # SENSOR ACQUISITION WORKER WITH TENSORFLOW MODEL
 # ==============================================================================
 class SensorAcquisitionWorker:
-    def __init__(self, data_queue, model_path="model_86pc.keras"):
+    def __init__(self, data_queue, model_path="multiLSTM-LOSO.keras"):
         self.data_queue = data_queue
         self.running = True
         self.is_streaming = False

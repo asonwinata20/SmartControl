@@ -166,7 +166,7 @@ class TelemetryDashboard(App):
         return root_layout
 
     def on_start(self):
-        self.worker = SensorAcquisitionWorker(self.telemetry_queue, model_path="model_86pc.keras")
+        self.worker = SensorAcquisitionWorker(self.telemetry_queue, model_path="multiLSTM-LOSO.keras")
         self.worker_thread = threading.Thread(target=self.worker.main_loop)
         self.worker_thread.daemon = True
         self.worker_thread.start()
