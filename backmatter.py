@@ -7,6 +7,7 @@ import struct
 from enum import IntEnum
 import numpy as np
 from collections import deque
+import joblib
 
 from scipy.signal import butter, filtfilt
 import tensorflow as tf
@@ -224,7 +225,7 @@ class CubeMarsCANManager:
 # SENSOR ACQUISITION WORKER
 # ==============================================================================
 class SensorAcquisitionWorker:
-    def __init__(self, data_queue, model_path="multiLSTM-LOSO.keras"):
+    def __init__(self, data_queue, model_path="multiLSTM-LOSO.keras", scaler_path="feature_scaler.pkl"):
         self.data_queue = data_queue
         self.running = True
         self.is_streaming = False
@@ -251,26 +252,31 @@ class SensorAcquisitionWorker:
         self.current_movement_label = "IDLE"
         self.movement_thread = None
 
-        # --- MODEL & AUTO CONTROL SETTINGS ---
+        # --- MODEL & SCALER SETTINGS ---
         self.auto_lstm_enabled = False
         self.model_path = model_path
+        self.scaler_path = scaler_path
         self.model = None
+        self.feature_scaler = None
         self.class_labels = ['Extension', 'Flexion', 'Grasping', 'Radial', 'Ulnar']
         
-        self.raw_emg_buffer_f = deque(maxlen=30)
-        self.raw_emg_buffer_e = deque(maxlen=30)
+        # Buffer of 15 samples to ensure stable filtfilt padding
+        self.raw_emg_buffer_f = deque(maxlen=20)
+        self.raw_emg_buffer_e = deque(maxlen=20)
+        
+        # 6-step temporal sequence buffer matching seq_len=6
         self.sequence_tensor_buffer = deque(maxlen=6)
 
-        # ADJUSTED CONFIDENCE THRESHOLDS (Flexion raised to 0.75 to fix bias)
+        # LOSO MATRIX DERIVED THRESHOLDS
         self.class_thresholds = {
-    'Extension': 0.65,  # Highly distinct (95.5% TP), low threshold for easy triggering
-    'Flexion':   0.65,  # High accuracy (96.8% TP), guarded against 10.2% Radial spillover
-    'Grasping':  0.68,  # Guarded against 17.1% Ulnar deviation false-triggers
-    'Radial':    0.70,  # High guard threshold; acts as common spillover target
-    'Ulnar':     0.65   # Guarded against 10.2% Grasping co-contraction spillover
-}
+            'Extension': 0.50,  
+            'Flexion':   0.65,  
+            'Grasping':  0.68,  
+            'Radial':    0.70,  
+            'Ulnar':     0.65
+        }
 
-        self.emg_activation_threshold = 40.0   
+        self.emg_activation_threshold = 30.0   
         self.cooldown_until = 0.0             
 
         self.e_stop_triggered = False
@@ -278,6 +284,7 @@ class SensorAcquisitionWorker:
         self.safety_overshoot_margin_deg = 5.0
 
         self.init_tf_model()
+        self.init_feature_scaler()
 
     def init_tf_model(self):
         if os.path.exists(self.model_path):
@@ -288,6 +295,16 @@ class SensorAcquisitionWorker:
                 print(f"⚠️ Error loading Keras model: {e}")
         else:
             print(f"⚠️ Model file '{self.model_path}' not found in directory.")
+
+    def init_feature_scaler(self):
+        if os.path.exists(self.scaler_path):
+            try:
+                self.feature_scaler = joblib.load(self.scaler_path)
+                print(f"⚙️ Feature MinMaxScaler '{self.scaler_path}' loaded successfully!")
+            except Exception as e:
+                print(f"⚠️ Error loading feature scaler: {e}")
+        else:
+            print(f"⚠️ Scaler file '{self.scaler_path}' not found. Using raw feature vectors.")
 
     def toggle_auto_lstm_control(self, enable: bool):
         self.auto_lstm_enabled = enable
@@ -302,8 +319,9 @@ class SensorAcquisitionWorker:
             if CAN_AVAILABLE and self.can_mgr:
                 self.can_mgr.emergency_release_all()
 
+    # --- EXACT PREPROCESSING PIPELINE FROM TRAINING CODE ---
     def apply_semg_filter(self, raw_buffer, fs=36.0):
-        if len(raw_buffer) < 15:
+        if len(raw_buffer) < 10:
             return np.array(raw_buffer, dtype=np.float32)
 
         data = np.array(raw_buffer, dtype=np.float32)
@@ -315,59 +333,69 @@ class SensorAcquisitionWorker:
 
         try:
             b, a = butter(2, [low_cutoff, high_cutoff], btype='bandpass')
-            pad_len = min(len(centered_data) - 1, 12)
+            pad_len = min(len(centered_data) - 1, 6)
             filtered_data = filtfilt(b, a, centered_data, padlen=pad_len)
         except Exception:
             filtered_data = centered_data
 
-        return np.abs(filtered_data)
+        return filtered_data
 
-    def extract_td_features(self, w_flex_raw, w_ext_raw, eps=1e-6):
-        w_f = self.apply_semg_filter(w_flex_raw, fs=36.0)
-        w_e = self.apply_semg_filter(w_ext_raw, fs=36.0)
+    def extract_enhanced_td_features(self, w_flex, w_ext, zc_thresh=1e-5, ssc_thresh=1e-5, eps=1e-6):
+        """Matches extract_enhanced_td_features() in training code exactly."""
+        rms_f, rms_e = np.sqrt(np.mean(w_flex**2)), np.sqrt(np.mean(w_ext**2))
+        mav_f, mav_e = np.mean(np.abs(w_flex)), np.mean(np.abs(w_ext))
+        wl_f, wl_e = np.sum(np.abs(np.diff(w_flex))), np.sum(np.abs(np.diff(w_ext)))
         
-        rms_f, rms_e = np.sqrt(np.mean(w_f**2)), np.sqrt(np.mean(w_e**2))
-        mav_f, mav_e = np.mean(np.abs(w_f)), np.mean(np.abs(w_e))
-        wl_f, wl_e = np.sum(np.abs(np.diff(w_f))), np.sum(np.abs(np.diff(w_e)))
-        zc_f = np.sum((w_f[:-1] * w_f[1:] < 0))
-        zc_e = np.sum((w_e[:-1] * w_e[1:] < 0))
-        var_f, var_e = np.var(w_f), np.var(w_e)
-        ssc_f = np.sum(np.diff(np.sign(np.diff(w_f))) != 0)
-        ssc_e = np.sum(np.diff(np.sign(np.diff(w_e))) != 0)
+        zc_f = np.sum((w_flex[:-1] * w_flex[1:] < 0) & (np.abs(w_flex[:-1] - w_flex[1:]) >= zc_thresh))
+        zc_e = np.sum((w_ext[:-1] * w_ext[1:] < 0) & (np.abs(w_ext[:-1] - w_ext[1:]) >= zc_thresh))
+        
+        var_f, var_e = np.var(w_flex), np.var(w_ext)
+        
+        diff_f, diff_e = np.diff(w_flex), np.diff(w_ext)
+        ssc_f = np.sum((diff_f[:-1] * diff_f[1:] < 0) & (np.abs(diff_f[:-1] - diff_f[1:]) >= ssc_thresh))
+        ssc_e = np.sum((diff_e[:-1] * diff_e[1:] < 0) & (np.abs(diff_e[:-1] - diff_e[1:]) >= ssc_thresh))
+        
         log_ratio = np.log((rms_f + eps) / (rms_e + eps))
         
         return [
-            rms_f, rms_e, 
-            mav_f, mav_e, 
-            wl_f, wl_e, 
-            zc_f, zc_e, 
-            var_f, var_e, 
-            ssc_f, ssc_e, 
-            log_ratio
+            rms_f, rms_e, mav_f, mav_e, wl_f, wl_e, zc_f, zc_e,
+            var_f, var_e, ssc_f, ssc_e, log_ratio
         ]
 
     def run_inference_step(self, flex_data, imu_acc, imu_gyr):
-        if len(self.raw_emg_buffer_f) < 30 or self.model is None:
+        if len(self.raw_emg_buffer_f) < 10 or self.model is None:
             return None, 0.0
 
-        td = self.extract_td_features(self.raw_emg_buffer_f, self.raw_emg_buffer_e)
-        frame_features = td + flex_data + imu_acc + imu_gyr
-        self.sequence_tensor_buffer.append(frame_features)
+        # Filter last 10 samples (win_len = 0.3s * 36 Hz = 10)
+        raw_f_win = list(self.raw_emg_buffer_f)[-10:]
+        raw_e_win = list(self.raw_emg_buffer_e)[-10:]
+
+        filt_f = self.apply_semg_filter(raw_f_win, fs=36.0)
+        filt_e = self.apply_semg_filter(raw_e_win, fs=36.0)
+
+        # 13 TD Features
+        td_feats = self.extract_enhanced_td_features(filt_f, filt_e)
+
+        # 24 Total Features (13 TD + 5 Flex + 6 IMU) exactly matching all_feature_cols
+        unscaled_frame = np.array(td_feats + flex_data + imu_acc + imu_gyr, dtype=np.float32).reshape(1, -1)
+
+        # Apply MinMaxScaler transform
+        if self.feature_scaler is not None:
+            scaled_frame = self.feature_scaler.transform(unscaled_frame)[0]
+        else:
+            scaled_frame = unscaled_frame[0]
+
+        self.sequence_tensor_buffer.append(scaled_frame)
 
         if len(self.sequence_tensor_buffer) < 6:
             return None, 0.0
 
-        input_data = np.array(self.sequence_tensor_buffer, dtype=np.float32)
-        
-        if hasattr(self.model, 'input_shape') and self.model.input_shape:
-            expected_features = self.model.input_shape[-1]
-            if expected_features and input_data.shape[-1] > expected_features:
-                input_data = input_data[:, :expected_features]
-
-        input_data = np.expand_dims(input_data, axis=0)
+        # Sequence tensor shape (1, 6, 24)
+        input_data = np.expand_dims(np.array(self.sequence_tensor_buffer, dtype=np.float32), axis=0)
 
         outputs = self.model(input_data, training=False)
         
+        # Handle Multi-Task output [class_out, reg_out]
         if isinstance(outputs, list):
             class_probs = outputs[0].numpy()[0]
         else:
@@ -597,9 +625,8 @@ class SensorAcquisitionWorker:
             self.can_mgr.set_move(cid, 0.0, spd, acc)
             time.sleep(0.005)
 
-        # CLOSED-LOOP POLLING: Keep driving & holding until motor reaches 0° ± 2.5°
         return_start = time.time()
-        max_return_timeout = 6.0  # Safety timeout against mechanical stalls
+        max_return_timeout = 6.0
         
         while time.time() - return_start < max_return_timeout:
             if self.e_stop_triggered:
@@ -608,7 +635,7 @@ class SensorAcquisitionWorker:
             all_motors_at_zero = True
             for cid, _, _, _ in targets:
                 cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
-                if abs(cur_pos) > 2.5:  # Outside zero tolerance window
+                if abs(cur_pos) > 2.5:
                     all_motors_at_zero = False
                     break
 
@@ -616,7 +643,7 @@ class SensorAcquisitionWorker:
                 print("✅ All motors arrived back at neutral (0.0°). Releasing holding torque.")
                 break
                 
-            time.sleep(0.02)  # Poll position at 50 Hz
+            time.sleep(0.02)
 
         self._finish_and_set_cooldown()
 
@@ -706,11 +733,14 @@ class SensorAcquisitionWorker:
 
                 now = time.time()
                 if self.auto_lstm_enabled and (self.movement_thread is None or not self.movement_thread.is_alive()) and now > self.cooldown_until:
-                    filtered_f = self.apply_semg_filter(self.raw_emg_buffer_f, fs=36.0)
-                    filtered_e = self.apply_semg_filter(self.raw_emg_buffer_e, fs=36.0)
+                    raw_f_win = list(self.raw_emg_buffer_f)[-10:]
+                    raw_e_win = list(self.raw_emg_buffer_e)[-10:]
+                    
+                    filt_f = self.apply_semg_filter(raw_f_win, fs=36.0)
+                    filt_e = self.apply_semg_filter(raw_e_win, fs=36.0)
 
-                    rms_f = np.sqrt(np.mean(filtered_f**2)) if len(filtered_f) >= 30 else 0
-                    rms_e = np.sqrt(np.mean(filtered_e**2)) if len(filtered_e) >= 30 else 0
+                    rms_f = np.sqrt(np.mean(filt_f**2)) if len(filt_f) >= 10 else 0
+                    rms_e = np.sqrt(np.mean(filt_e**2)) if len(filt_e) >= 10 else 0
                     
                     if (rms_f > self.emg_activation_threshold or rms_e > self.emg_activation_threshold):
                         pred_class, confidence = self.run_inference_step([f1, f2, f3, f4, f5], [ax, ay, az], [gx, gy, gz])
