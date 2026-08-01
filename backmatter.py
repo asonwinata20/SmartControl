@@ -568,6 +568,35 @@ class SensorAcquisitionWorker:
         )
         self.movement_thread.start()
 
+    def _return_to_zero_and_finish(self, targets):
+        """Drives target motors back to neutral 0.0° and locks holding torque until arrived before releasing."""
+        self.current_movement_label = "RETURNING_NEUTRAL"
+        for cid, _, spd, acc in targets:
+            self.can_mgr.set_move(cid, 0.0, spd, acc)
+            time.sleep(0.005)
+
+        return_start = time.time()
+        max_return_timeout = 6.0
+        
+        while time.time() - return_start < max_return_timeout:
+            if self.e_stop_triggered:
+                break
+            
+            all_motors_at_zero = True
+            for cid, _, _, _ in targets:
+                cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
+                if abs(cur_pos) > 2.5:
+                    all_motors_at_zero = False
+                    break
+
+            if all_motors_at_zero:
+                print("✅ All motors arrived back at neutral (0.0°). Releasing holding torque.")
+                break
+                
+            time.sleep(0.02)
+
+        self._finish_and_set_cooldown()
+
     def _run_smart_aan_fsm(self, movement_type: str, speed_mode: str, dyn_targets=None):
         self.current_movement_label = f"DETECTED:{movement_type.upper()}"
         time.sleep(0.5)
@@ -635,10 +664,11 @@ class SensorAcquisitionWorker:
 
             time.sleep(0.05)
 
+        # IF PATIENT REACHED GOAL, RETURN TO NEUTRAL (0°) THEN UNLOCK
         if patient_reached:
             self.current_movement_label = "PATIENT_SUCCESS"
             time.sleep(1.0)
-            self._finish_and_set_cooldown()
+            self._return_to_zero_and_finish(targets)
             return
 
         # PHASE 2: MOTOR ASSIST WITH LIVE MAE/RMSE SAMPLING
@@ -674,7 +704,7 @@ class SensorAcquisitionWorker:
 
             time.sleep(0.02)  # Sample live telemetry at 50 Hz
 
-        # --- COMPUTE & LOG LIVE MAE & RMSE ---
+        # COMPUTE & LOG LIVE MAE & RMSE AT END OF ASSIST PHASE
         self._calculate_and_log_test_metrics(
             movement_type, 
             wrist_true_spds, wrist_pred_spds, 
@@ -697,33 +727,8 @@ class SensorAcquisitionWorker:
             self.current_movement_label = f"ASSIST_HOLD_{sec_left}S"
             time.sleep(1.0)
 
-        # PHASE 4: RETURN TO NEUTRAL (0°) AND LOCK UNTIL ARRIVED
-        self.current_movement_label = "RETURNING_NEUTRAL"
-        for cid, _, spd, acc in targets:
-            self.can_mgr.set_move(cid, 0.0, spd, acc)
-            time.sleep(0.005)
-
-        return_start = time.time()
-        max_return_timeout = 6.0
-        
-        while time.time() - return_start < max_return_timeout:
-            if self.e_stop_triggered:
-                break
-            
-            all_motors_at_zero = True
-            for cid, _, _, _ in targets:
-                cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
-                if abs(cur_pos) > 2.5:
-                    all_motors_at_zero = False
-                    break
-
-            if all_motors_at_zero:
-                print("✅ All motors arrived back at neutral (0.0°). Releasing holding torque.")
-                break
-                
-            time.sleep(0.02)
-
-        self._finish_and_set_cooldown()
+        # PHASE 4: RETURN TO NEUTRAL (0°) AND LOCK UNTIL ARRIVED BEFORE UNLOCKING
+        self._return_to_zero_and_finish(targets)
 
     def _calculate_and_log_test_metrics(self, movement_type, w_true, w_pred, f_true, f_pred):
         """Calculates MAE/RMSE across actuator groups and logs to CSV."""
@@ -745,7 +750,7 @@ class SensorAcquisitionWorker:
         tot_rmse = np.sqrt(np.mean((all_true - all_pred)**2)) if len(all_true) > 0 else 0.0
         sample_count = len(all_true)
 
-        # 1. Print Summary Report to Terminal
+        # Print Summary Report to Terminal
         print("\n" + "="*58)
         print(f"📊 LIVE PERFORMANCE TEST RESULTS ({movement_type.upper()})")
         print("="*58)
@@ -755,7 +760,7 @@ class SensorAcquisitionWorker:
         print(f" OVERALL COMBINED  : MAE = {tot_mae:6.2f} eRPM | RMSE = {tot_rmse:6.2f} eRPM")
         print("="*58 + "\n")
 
-        # 2. Append directly to CSV file
+        # Append directly to CSV file
         try:
             timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
             with open(self.results_csv_path, mode='a', newline='') as f:
