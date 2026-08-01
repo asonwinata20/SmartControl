@@ -272,7 +272,7 @@ class SensorAcquisitionWorker:
             'Extension': 0.45,  
             'Flexion':   0.65,  
             'Grasping':  0.68,  
-            'Radial':    0.65,  
+            'Radial':    0.55,  
             'Ulnar':     0.65
         }
 
