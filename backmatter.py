@@ -646,7 +646,7 @@ class SensorAcquisitionWorker:
                     
                     if (rms_f > self.emg_activation_threshold or rms_e > self.emg_activation_threshold):
                         pred_class, confidence = self.run_inference_step([f1, f2, f3, f4, f5], [ax, ay, az], [gx, gy, gz])
-                        if pred_class and confidence >= 0.80:
+                        if pred_class and confidence >= 0.60:
                             print(f"🎯 MODEL DETECTED: {pred_class} ({confidence*100:.1f}%) -> Auto-Starting AAN")
                             self.auto_trigger_smart_aan(pred_class)
 
