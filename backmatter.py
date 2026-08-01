@@ -8,8 +8,10 @@ from enum import IntEnum
 import numpy as np
 from collections import deque
 
+from scipy.signal import butter, filtfilt
 import tensorflow as tf
 
+# --- HARDWARE INTEGRATION GUARDS ---
 try:
     import board
     import busio
@@ -220,7 +222,7 @@ class CubeMarsCANManager:
 
 
 # ==============================================================================
-# SENSOR ACQUISITION WORKER WITH TENSORFLOW MODEL
+# SENSOR ACQUISITION WORKER WITH EXACT TRAINING PREPROCESSING
 # ==============================================================================
 class SensorAcquisitionWorker:
     def __init__(self, data_queue, model_path="multiLSTM-LOSO.keras"):
@@ -260,9 +262,16 @@ class SensorAcquisitionWorker:
         self.raw_emg_buffer_e = deque(maxlen=30)
         self.sequence_tensor_buffer = deque(maxlen=6)
 
-        # TUNABLE INFERENCE & SAFETY HYPERPARAMETERS
-        self.confidence_threshold = 0.65       # Adjusted from 0.80 for better responsiveness
-        self.emg_activation_threshold = 40.0   # Baseline RMS activation threshold
+        # PER-CLASS CONFIDENCE THRESHOLDS
+        self.class_thresholds = {
+            'Extension': 0.45,  # Lower threshold for weaker extensor sEMG amplitude
+            'Flexion':   0.60,
+            'Grasping':  0.50,  # Lower threshold for co-contraction probability splitting
+            'Radial':    0.70,  # Higher threshold to eliminate dominant Radial false-positives
+            'Ulnar':     0.60
+        }
+
+        self.emg_activation_threshold = 40.0   # Baseline RMS threshold
         self.cooldown_until = 0.0             # Refractory timer
 
         self.e_stop_triggered = False
@@ -295,9 +304,37 @@ class SensorAcquisitionWorker:
             if CAN_AVAILABLE and self.can_mgr:
                 self.can_mgr.emergency_release_all()
 
-    def extract_td_features(self, w_flex, w_ext, eps=1e-6):
-        """Extracts 13 Time-Domain sEMG features matching model shape."""
-        w_f, w_e = np.array(w_flex), np.array(w_ext)
+    # --- EXACT TRAINING FILTER IMPLEMENTATION ---
+    def apply_semg_filter(self, raw_buffer, fs=36.0):
+        """Replicates exact training pipeline: Mean removal + 2nd Order 1.0-15.0 Hz Bandpass via filtfilt."""
+        if len(raw_buffer) < 15:
+            return np.array(raw_buffer, dtype=np.float32)
+
+        data = np.array(raw_buffer, dtype=np.float32)
+        
+        # 1. Zero-Mean DC Subtraction
+        centered_data = data - np.mean(data)
+
+        # 2. Replicate exact training filter design
+        nyq = 0.5 * fs
+        low_cutoff = 1.0 / nyq
+        high_cutoff = min(15.0 / nyq, 0.99)
+
+        try:
+            b, a = butter(2, [low_cutoff, high_cutoff], btype='bandpass')
+            pad_len = min(len(centered_data) - 1, 12)
+            filtered_data = filtfilt(b, a, centered_data, padlen=pad_len)
+        except Exception:
+            filtered_data = centered_data
+
+        # 3. Full-Wave Rectification (|x|) for Time-Domain feature extraction
+        return np.abs(filtered_data)
+
+    def extract_td_features(self, w_flex_raw, w_ext_raw, eps=1e-6):
+        """Filters raw sEMG buffers using training filter before extracting 13 TD features."""
+        w_f = self.apply_semg_filter(w_flex_raw, fs=36.0)
+        w_e = self.apply_semg_filter(w_ext_raw, fs=36.0)
+        
         rms_f, rms_e = np.sqrt(np.mean(w_f**2)), np.sqrt(np.mean(w_e**2))
         mav_f, mav_e = np.mean(np.abs(w_f)), np.mean(np.abs(w_e))
         wl_f, wl_e = np.sum(np.abs(np.diff(w_f))), np.sum(np.abs(np.diff(w_e)))
@@ -322,6 +359,7 @@ class SensorAcquisitionWorker:
         if len(self.raw_emg_buffer_f) < 30 or self.model is None:
             return None, 0.0
 
+        # Extract 13 sEMG TD + 5 Flex + 6 IMU = 24 features
         td = self.extract_td_features(self.raw_emg_buffer_f, self.raw_emg_buffer_e)
         frame_features = td + flex_data + imu_acc + imu_gyr
         self.sequence_tensor_buffer.append(frame_features)
@@ -329,6 +367,7 @@ class SensorAcquisitionWorker:
         if len(self.sequence_tensor_buffer) < 6:
             return None, 0.0
 
+        # Construct shape (1, 6, 24) tensor
         input_data = np.array(self.sequence_tensor_buffer, dtype=np.float32)
         
         if hasattr(self.model, 'input_shape') and self.model.input_shape:
@@ -338,6 +377,7 @@ class SensorAcquisitionWorker:
 
         input_data = np.expand_dims(input_data, axis=0)
 
+        # Execute direct Keras forward pass
         outputs = self.model(input_data, training=False)
         
         if isinstance(outputs, list):
@@ -349,8 +389,18 @@ class SensorAcquisitionWorker:
         confidence = float(class_probs[predicted_idx])
         predicted_label = self.class_labels[predicted_idx]
 
-        return predicted_label, confidence
+        required_thresh = self.class_thresholds.get(predicted_label, 0.60)
 
+        # PRINT PROBABILITY DISTRIBUTION TO CONSOLE FOR DIAGNOSTICS
+        probs_str = " | ".join([f"{lbl[:3]}:{class_probs[i]:.2f}" for i, lbl in enumerate(self.class_labels)])
+        print(f"📊 [PROBS] {probs_str} -> Top: {predicted_label} ({confidence:.2f} vs Req: {required_thresh:.2f})")
+
+        if confidence >= required_thresh:
+            return predicted_label, confidence
+
+        return None, 0.0
+
+    # --- HARDWARE INITIALIZATION ---
     def reinitialize_hardware(self):
         if self.ser and hasattr(self.ser, 'is_open') and self.ser.is_open:
             try: self.ser.close()
@@ -605,8 +655,8 @@ class SensorAcquisitionWorker:
 
     def main_loop(self):
         self.initialize_hardware_inside_thread()
-        target_sample_rate = 100    
-        sample_interval = 1.0 / target_sample_rate  
+        target_sample_rate = 36    # MATCHES TRAINING SAMPLING RATE (36 Hz)
+        sample_interval = 1.0 / target_sample_rate  # ~27.7 ms
         next_sample_time = time.perf_counter()
 
         while self.running:
@@ -650,12 +700,15 @@ class SensorAcquisitionWorker:
 
                 now = time.time()
                 if self.auto_lstm_enabled and (self.movement_thread is None or not self.movement_thread.is_alive()) and now > self.cooldown_until:
-                    rms_f = np.sqrt(np.mean(np.array(self.raw_emg_buffer_f)**2)) if len(self.raw_emg_buffer_f) >= 30 else 0
-                    rms_e = np.sqrt(np.mean(np.array(self.raw_emg_buffer_e)**2)) if len(self.raw_emg_buffer_e) >= 30 else 0
+                    filtered_f = self.apply_semg_filter(self.raw_emg_buffer_f, fs=36.0)
+                    filtered_e = self.apply_semg_filter(self.raw_emg_buffer_e, fs=36.0)
+
+                    rms_f = np.sqrt(np.mean(filtered_f**2)) if len(filtered_f) >= 30 else 0
+                    rms_e = np.sqrt(np.mean(filtered_e**2)) if len(filtered_e) >= 30 else 0
                     
                     if (rms_f > self.emg_activation_threshold or rms_e > self.emg_activation_threshold):
                         pred_class, confidence = self.run_inference_step([f1, f2, f3, f4, f5], [ax, ay, az], [gx, gy, gz])
-                        if pred_class and confidence >= self.confidence_threshold:
+                        if pred_class and confidence > 0.0:
                             print(f"🎯 MODEL DETECTED: {pred_class} ({confidence*100:.1f}%) -> Auto-Starting AAN")
                             self.auto_trigger_smart_aan(pred_class)
 
