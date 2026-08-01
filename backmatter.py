@@ -283,7 +283,8 @@ class SensorAcquisitionWorker:
         }
 
         self.emg_activation_threshold = 30.0   
-        self.cooldown_until = 0.0             
+        self.cooldown_until = 0.0    
+        self.warmup_until = 0.0         
 
         self.e_stop_triggered = False
         self.e_stop_reason = ""
@@ -346,8 +347,15 @@ class SensorAcquisitionWorker:
         self.auto_lstm_enabled = enable
         if enable:
             self.calibrate_imu_bias()
-            self.current_movement_label = "LSTM_MONITORING"
+            self.warmup_until = time.time() + 5.0  # 5-SECOND WARMUP PERIOD
+            self.current_movement_label = "LSTM_WARMUP_5.0S"
             self.is_streaming = True
+            
+            # LOCK MOTORS AT NEUTRAL (0.0°) DURING WARMUP
+            if CAN_AVAILABLE and self.can_mgr:
+                print("🔒 Locking motors at neutral 0.0° during 5s warmup phase...")
+                for cid in self.motor_ids:
+                    self.can_mgr.set_move(cid, 0.0, 1000.0, 200.0)
         else:
             self.auto_lstm_enabled = False
             self.is_streaming = False
@@ -860,7 +868,24 @@ class SensorAcquisitionWorker:
                 self.raw_emg_buffer_e.append(emg2)
 
                 now = time.time()
-                if self.auto_lstm_enabled and (self.movement_thread is None or not self.movement_thread.is_alive()) and now > self.cooldown_until:
+
+                # --- 5-SECOND WARMUP / BUFFER PRIMING HANDLING ---
+                if self.auto_lstm_enabled and now < self.warmup_until:
+                    remaining_warmup = round(self.warmup_until - now, 1)
+                    self.current_movement_label = f"WARMUP_{remaining_warmup}S"
+                elif self.auto_lstm_enabled and (self.movement_thread is None or not self.movement_thread.is_alive()) and now > self.cooldown_until:
+                    # TRANSITION FROM WARMUP TO MONITORING: UNLOCK MOTORS & FLUSH NOISE
+                    if "WARMUP" in self.current_movement_label or self.current_movement_label == "LSTM_WARMUP_5.0S":
+                        self.current_movement_label = "LSTM_MONITORING"
+                        print("🔓 Warmup completed! Unlocking motor torque for continuous monitoring.")
+                        if CAN_AVAILABLE and self.can_mgr:
+                            self.can_mgr.emergency_release_all()
+                        
+                        # Flush transient warmup samples
+                        self.raw_emg_buffer_f.clear()
+                        self.raw_emg_buffer_e.clear()
+                        self.sequence_tensor_buffer.clear()
+
                     raw_f_win = list(self.raw_emg_buffer_f)[-10:]
                     raw_e_win = list(self.raw_emg_buffer_e)[-10:]
                     
