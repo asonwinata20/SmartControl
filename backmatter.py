@@ -211,7 +211,6 @@ class CubeMarsCANManager:
                 time.sleep(0.005)
 
     def get_motor_state_data(self, cid: int) -> tuple[float, float, float]:
-        """Returns tuple of (actual_position_deg, actual_speed_erpm, target_position_deg)."""
         with self.bus_lock:
             st = self.motor_states.get(cid, {})
             telem = self.telemetry.get(cid, {})
@@ -222,7 +221,7 @@ class CubeMarsCANManager:
 
 
 # ==============================================================================
-# SENSOR ACQUISITION WORKER WITH EXACT TRAINING PREPROCESSING
+# SENSOR ACQUISITION WORKER
 # ==============================================================================
 class SensorAcquisitionWorker:
     def __init__(self, data_queue, model_path="multiLSTM-LOSO.keras"):
@@ -262,17 +261,17 @@ class SensorAcquisitionWorker:
         self.raw_emg_buffer_e = deque(maxlen=30)
         self.sequence_tensor_buffer = deque(maxlen=6)
 
-        # PER-CLASS CONFIDENCE THRESHOLDS
+        # ADJUSTED CONFIDENCE THRESHOLDS (Flexion raised to 0.75 to fix bias)
         self.class_thresholds = {
-            'Extension': 0.45,  # Lower threshold for weaker extensor sEMG amplitude
-            'Flexion':   0.60,
-            'Grasping':  0.50,  # Lower threshold for co-contraction probability splitting
-            'Radial':    0.70,  # Higher threshold to eliminate dominant Radial false-positives
+            'Extension': 0.45,  
+            'Flexion':   0.75,  # Increased from 0.60 to prevent bias/false triggers
+            'Grasping':  0.50,  
+            'Radial':    0.70,  
             'Ulnar':     0.60
         }
 
-        self.emg_activation_threshold = 40.0   # Baseline RMS threshold
-        self.cooldown_until = 0.0             # Refractory timer
+        self.emg_activation_threshold = 40.0   
+        self.cooldown_until = 0.0             
 
         self.e_stop_triggered = False
         self.e_stop_reason = ""
@@ -281,7 +280,6 @@ class SensorAcquisitionWorker:
         self.init_tf_model()
 
     def init_tf_model(self):
-        """Loads standard Keras model file directly into memory."""
         if os.path.exists(self.model_path):
             try:
                 self.model = tf.keras.models.load_model(self.model_path)
@@ -304,18 +302,13 @@ class SensorAcquisitionWorker:
             if CAN_AVAILABLE and self.can_mgr:
                 self.can_mgr.emergency_release_all()
 
-    # --- EXACT TRAINING FILTER IMPLEMENTATION ---
     def apply_semg_filter(self, raw_buffer, fs=36.0):
-        """Replicates exact training pipeline: Mean removal + 2nd Order 1.0-15.0 Hz Bandpass via filtfilt."""
         if len(raw_buffer) < 15:
             return np.array(raw_buffer, dtype=np.float32)
 
         data = np.array(raw_buffer, dtype=np.float32)
-        
-        # 1. Zero-Mean DC Subtraction
         centered_data = data - np.mean(data)
 
-        # 2. Replicate exact training filter design
         nyq = 0.5 * fs
         low_cutoff = 1.0 / nyq
         high_cutoff = min(15.0 / nyq, 0.99)
@@ -327,11 +320,9 @@ class SensorAcquisitionWorker:
         except Exception:
             filtered_data = centered_data
 
-        # 3. Full-Wave Rectification (|x|) for Time-Domain feature extraction
         return np.abs(filtered_data)
 
     def extract_td_features(self, w_flex_raw, w_ext_raw, eps=1e-6):
-        """Filters raw sEMG buffers using training filter before extracting 13 TD features."""
         w_f = self.apply_semg_filter(w_flex_raw, fs=36.0)
         w_e = self.apply_semg_filter(w_ext_raw, fs=36.0)
         
@@ -359,7 +350,6 @@ class SensorAcquisitionWorker:
         if len(self.raw_emg_buffer_f) < 30 or self.model is None:
             return None, 0.0
 
-        # Extract 13 sEMG TD + 5 Flex + 6 IMU = 24 features
         td = self.extract_td_features(self.raw_emg_buffer_f, self.raw_emg_buffer_e)
         frame_features = td + flex_data + imu_acc + imu_gyr
         self.sequence_tensor_buffer.append(frame_features)
@@ -367,7 +357,6 @@ class SensorAcquisitionWorker:
         if len(self.sequence_tensor_buffer) < 6:
             return None, 0.0
 
-        # Construct shape (1, 6, 24) tensor
         input_data = np.array(self.sequence_tensor_buffer, dtype=np.float32)
         
         if hasattr(self.model, 'input_shape') and self.model.input_shape:
@@ -377,7 +366,6 @@ class SensorAcquisitionWorker:
 
         input_data = np.expand_dims(input_data, axis=0)
 
-        # Execute direct Keras forward pass
         outputs = self.model(input_data, training=False)
         
         if isinstance(outputs, list):
@@ -391,7 +379,6 @@ class SensorAcquisitionWorker:
 
         required_thresh = self.class_thresholds.get(predicted_label, 0.60)
 
-        # PRINT PROBABILITY DISTRIBUTION TO CONSOLE FOR DIAGNOSTICS
         probs_str = " | ".join([f"{lbl[:3]}:{class_probs[i]:.2f}" for i, lbl in enumerate(self.class_labels)])
         print(f"📊 [PROBS] {probs_str} -> Top: {predicted_label} ({confidence:.2f} vs Req: {required_thresh:.2f})")
 
@@ -400,7 +387,6 @@ class SensorAcquisitionWorker:
 
         return None, 0.0
 
-    # --- HARDWARE INITIALIZATION ---
     def reinitialize_hardware(self):
         if self.ser and hasattr(self.ser, 'is_open') and self.ser.is_open:
             try: self.ser.close()
@@ -605,19 +591,39 @@ class SensorAcquisitionWorker:
             self.current_movement_label = f"ASSIST_HOLD_{sec_left}S"
             time.sleep(1.0)
 
-        # PHASE 4: RETURN TO NEUTRAL (0°)
+        # PHASE 4: RETURN TO NEUTRAL (0°) AND LOCK UNTIL ARRIVED
         self.current_movement_label = "RETURNING_NEUTRAL"
         for cid, _, spd, acc in targets:
             self.can_mgr.set_move(cid, 0.0, spd, acc)
             time.sleep(0.005)
 
-        time.sleep(2.0)
+        # CLOSED-LOOP POLLING: Keep driving & holding until motor reaches 0° ± 2.5°
+        return_start = time.time()
+        max_return_timeout = 6.0  # Safety timeout against mechanical stalls
+        
+        while time.time() - return_start < max_return_timeout:
+            if self.e_stop_triggered:
+                break
+            
+            all_motors_at_zero = True
+            for cid, _, _, _ in targets:
+                cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
+                if abs(cur_pos) > 2.5:  # Outside zero tolerance window
+                    all_motors_at_zero = False
+                    break
+
+            if all_motors_at_zero:
+                print("✅ All motors arrived back at neutral (0.0°). Releasing holding torque.")
+                break
+                
+            time.sleep(0.02)  # Poll position at 50 Hz
+
         self._finish_and_set_cooldown()
 
     def _finish_and_set_cooldown(self):
         """Flushes buffers, unlocks motor torque to zero, and activates 3.0s cooldown."""
         if CAN_AVAILABLE and self.can_mgr:
-            self.can_mgr.emergency_release_all()  # <--- AUTOMATIC UNLOCK AFTER MOVEMENT
+            self.can_mgr.emergency_release_all()  
             
         self.raw_emg_buffer_f.clear()
         self.raw_emg_buffer_e.clear()
@@ -655,8 +661,8 @@ class SensorAcquisitionWorker:
 
     def main_loop(self):
         self.initialize_hardware_inside_thread()
-        target_sample_rate = 36    # MATCHES TRAINING SAMPLING RATE (36 Hz)
-        sample_interval = 1.0 / target_sample_rate  # ~27.7 ms
+        target_sample_rate = 36    
+        sample_interval = 1.0 / target_sample_rate  
         next_sample_time = time.perf_counter()
 
         while self.running:
