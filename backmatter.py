@@ -263,7 +263,7 @@ class SensorAcquisitionWorker:
 
         # ADJUSTED CONFIDENCE THRESHOLDS (Flexion raised to 0.75 to fix bias)
         self.class_thresholds = {
-    'Extension': 0.50,  # Highly distinct (95.5% TP), low threshold for easy triggering
+    'Extension': 0.65,  # Highly distinct (95.5% TP), low threshold for easy triggering
     'Flexion':   0.65,  # High accuracy (96.8% TP), guarded against 10.2% Radial spillover
     'Grasping':  0.68,  # Guarded against 17.1% Ulnar deviation false-triggers
     'Radial':    0.70,  # High guard threshold; acts as common spillover target
