@@ -150,7 +150,6 @@ class TelemetryDashboard(App):
         self.lbl_emg_data = Label(text="EMG PROFILES:\nFLEXOR: --\nEXTENSOR: --", font_size='10sp', bold=True, halign='left', valign='middle', color=(1.0, 0.4, 1.0, 1))
         self.lbl_motion_data = Label(text="6-AXIS IMU METRICS:\nACC: X:--g | Y:--g | Z:--g\nGYR: X:--dps | Y:--dps | Z:--dps", font_size='10sp', bold=True, halign='left', valign='middle', color=(0.0, 0.8, 1.0, 1))
         
-        # DISPLAY BOTH LIVE DEGREE AND TARGET DEGREE
         self.lbl_motor_data = Label(
             text="CUBEMARS MOTOR TELEMETRY:\nM1: --° / Tgt: --° (-- eRPM) | M2: --° / Tgt: --° (-- eRPM)\nM11: --° / Tgt: --° (-- eRPM) | M12: --° / Tgt: --° (-- eRPM)", 
             font_size='10sp', bold=True, halign='left', valign='middle', color=(1.0, 0.8, 0.2, 1)
@@ -262,10 +261,10 @@ class TelemetryDashboard(App):
                 latest_emg = frame['emg']
                 latest_a = frame['accel']
                 latest_g = frame['gyro']
-                latest_m1 = frame['m1']   # [actual_pos, actual_spd, target_pos]
-                latest_m2 = frame['m2']   # [actual_pos, actual_spd, target_pos]
-                latest_m11 = frame['m11'] # [actual_pos, actual_spd, target_pos]
-                latest_m12 = frame['m12'] # [actual_pos, actual_spd, target_pos]
+                latest_m1 = frame['m1']   
+                latest_m2 = frame['m2']   
+                latest_m11 = frame['m11'] 
+                latest_m12 = frame['m12'] 
 
                 for i in range(5): self.buffers[i].append(latest_f[i])
                 for i in range(2): self.buffers[5 + i].append(latest_emg[i])

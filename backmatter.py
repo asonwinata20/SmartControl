@@ -4,6 +4,7 @@ import threading
 import subprocess
 import os
 import struct
+import csv
 from enum import IntEnum
 import numpy as np
 from collections import deque
@@ -256,20 +257,25 @@ class SensorAcquisitionWorker:
         self.auto_lstm_enabled = False
         self.model_path = model_path
         self.scaler_path = scaler_path
+        self.wrist_scaler_path = "wrist_target_scaler.pkl"
+        self.finger_scaler_path = "finger_target_scaler.pkl"
+
         self.model = None
         self.feature_scaler = None
+        self.wrist_scaler = None
+        self.finger_scaler = None
         self.class_labels = ['Extension', 'Flexion', 'Grasping', 'Radial', 'Ulnar']
         
-        # Buffer of 15 samples to ensure stable filtfilt padding
+        # Buffer of 20 samples to ensure stable filtfilt padding
         self.raw_emg_buffer_f = deque(maxlen=20)
         self.raw_emg_buffer_e = deque(maxlen=20)
         
         # 6-step temporal sequence buffer matching seq_len=6
         self.sequence_tensor_buffer = deque(maxlen=6)
 
-        # LOSO MATRIX DERIVED THRESHOLDS
+        # OPTIMIZED REAL-TIME THRESHOLDS
         self.class_thresholds = {
-            'Extension': 0.40,  
+            'Extension': 0.45,  
             'Flexion':   0.65,  
             'Grasping':  0.68,  
             'Radial':    0.50,  
@@ -282,9 +288,28 @@ class SensorAcquisitionWorker:
         self.e_stop_triggered = False
         self.e_stop_reason = ""
         self.safety_overshoot_margin_deg = 5.0
+        self.results_csv_path = "live_test_results.csv"
 
         self.init_tf_model()
         self.init_feature_scaler()
+        self.init_target_scalers()
+        self._ensure_csv_header()
+
+    def _ensure_csv_header(self):
+        """Ensures live_test_results.csv exists with structured header columns."""
+        if not os.path.exists(self.results_csv_path):
+            try:
+                with open(self.results_csv_path, mode='w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        'Timestamp', 'Movement', 'Samples', 
+                        'Wrist_MAE_eRPM', 'Wrist_RMSE_eRPM', 
+                        'Finger_MAE_eRPM', 'Finger_RMSE_eRPM', 
+                        'Overall_MAE_eRPM', 'Overall_RMSE_eRPM'
+                    ])
+                print(f"📁 Initialized test results log at '{self.results_csv_path}'")
+            except Exception as e:
+                print(f"⚠️ Error creating CSV header: {e}")
 
     def init_tf_model(self):
         if os.path.exists(self.model_path):
@@ -305,6 +330,17 @@ class SensorAcquisitionWorker:
                 print(f"⚠️ Error loading feature scaler: {e}")
         else:
             print(f"⚠️ Scaler file '{self.scaler_path}' not found. Using raw feature vectors.")
+
+    def init_target_scalers(self):
+        if os.path.exists(self.wrist_scaler_path) and os.path.exists(self.finger_scaler_path):
+            try:
+                self.wrist_scaler = joblib.load(self.wrist_scaler_path)
+                self.finger_scaler = joblib.load(self.finger_scaler_path)
+                print("⚙️ Target Scalers for Motor Speed/Accel loaded successfully!")
+            except Exception as e:
+                print(f"⚠️ Error loading target scalers: {e}")
+        else:
+            print("⚠️ Target scalers missing. Falling back to preset motor speeds.")
 
     def toggle_auto_lstm_control(self, enable: bool):
         self.auto_lstm_enabled = enable
@@ -364,7 +400,7 @@ class SensorAcquisitionWorker:
 
     def run_inference_step(self, flex_data, imu_acc, imu_gyr):
         if len(self.raw_emg_buffer_f) < 10 or self.model is None:
-            return None, 0.0
+            return None, 0.0, None
 
         # Filter last 10 samples (win_len = 0.3s * 36 Hz = 10)
         raw_f_win = list(self.raw_emg_buffer_f)[-10:]
@@ -376,7 +412,7 @@ class SensorAcquisitionWorker:
         # 13 TD Features
         td_feats = self.extract_enhanced_td_features(filt_f, filt_e)
 
-        # 24 Total Features (13 TD + 5 Flex + 6 IMU) exactly matching all_feature_cols
+        # 24 Total Features (13 TD + 5 Flex + 6 IMU)
         unscaled_frame = np.array(td_feats + flex_data + imu_acc + imu_gyr, dtype=np.float32).reshape(1, -1)
 
         # Apply MinMaxScaler transform
@@ -388,18 +424,26 @@ class SensorAcquisitionWorker:
         self.sequence_tensor_buffer.append(scaled_frame)
 
         if len(self.sequence_tensor_buffer) < 6:
-            return None, 0.0
+            return None, 0.0, None
 
-        # Sequence tensor shape (1, 6, 24)
         input_data = np.expand_dims(np.array(self.sequence_tensor_buffer, dtype=np.float32), axis=0)
-
         outputs = self.model(input_data, training=False)
         
-        # Handle Multi-Task output [class_out, reg_out]
+        # UNPACK MULTI-TASK OUTPUTS (Classification + Motor Regression)
         if isinstance(outputs, list):
-            class_probs = outputs[0].numpy()[0]
+            class_probs = outputs[0].numpy()[0]          # Branch 1: Classification (Softmax)
+            pred_motor_scaled = outputs[1].numpy()[0]    # Branch 2: Motor Dynamics Regression (8 targets)
         else:
             class_probs = outputs.numpy()[0]
+            pred_motor_scaled = None
+
+        # UN-SCALE PREDICTED MOTOR SPEEDS AND ACCELERATIONS
+        predicted_dynamics = None
+        if pred_motor_scaled is not None and self.wrist_scaler is not None and self.finger_scaler is not None:
+            wrist_real = self.wrist_scaler.inverse_transform(pred_motor_scaled[:4].reshape(1, -1))[0]
+            finger_real = self.finger_scaler.inverse_transform(pred_motor_scaled[4:].reshape(1, -1))[0]
+            # Unpacked array: [M1_Spd, M1_Acc, M2_Spd, M2_Acc, M11_Spd, M11_Acc, M12_Spd, M12_Acc]
+            predicted_dynamics = np.concatenate([wrist_real, finger_real])
 
         predicted_idx = np.argmax(class_probs)
         confidence = float(class_probs[predicted_idx])
@@ -408,12 +452,15 @@ class SensorAcquisitionWorker:
         required_thresh = self.class_thresholds.get(predicted_label, 0.60)
 
         probs_str = " | ".join([f"{lbl[:3]}:{class_probs[i]:.2f}" for i, lbl in enumerate(self.class_labels)])
-        print(f"📊 [PROBS] {probs_str} -> Top: {predicted_label} ({confidence:.2f} vs Req: {required_thresh:.2f})")
+        if predicted_dynamics is not None:
+            print(f"📊 [PROBS] {probs_str} -> Top: {predicted_label} ({confidence:.2f} vs Req: {required_thresh:.2f}) | Pred M12 Spd: {predicted_dynamics[6]:.1f} eRPM")
+        else:
+            print(f"📊 [PROBS] {probs_str} -> Top: {predicted_label} ({confidence:.2f} vs Req: {required_thresh:.2f})")
 
         if confidence >= required_thresh:
-            return predicted_label, confidence
+            return predicted_label, confidence, predicted_dynamics
 
-        return None, 0.0
+        return None, 0.0, None
 
     def reinitialize_hardware(self):
         if self.ser and hasattr(self.ser, 'is_open') and self.ser.is_open:
@@ -507,7 +554,7 @@ class SensorAcquisitionWorker:
             self.can_mgr.emergency_release_all()
         print(f"🚨 AUTOMATIC OVER-ANGLE GUARD TRIGGERED: {reason}")
 
-    def auto_trigger_smart_aan(self, detected_gesture: str, speed_mode='Slow'):
+    def auto_trigger_smart_aan(self, detected_gesture: str, speed_mode='Slow', dyn_targets=None):
         if self.movement_thread and self.movement_thread.is_alive():
             return
 
@@ -516,12 +563,12 @@ class SensorAcquisitionWorker:
 
         self.movement_thread = threading.Thread(
             target=self._run_smart_aan_fsm, 
-            args=(detected_gesture.lower(), speed_mode, None),
+            args=(detected_gesture.lower(), speed_mode, dyn_targets),
             daemon=True
         )
         self.movement_thread.start()
 
-    def _run_smart_aan_fsm(self, movement_type: str, speed_mode: str, on_complete_callback=None):
+    def _run_smart_aan_fsm(self, movement_type: str, speed_mode: str, dyn_targets=None):
         self.current_movement_label = f"DETECTED:{movement_type.upper()}"
         time.sleep(0.5)
 
@@ -530,22 +577,38 @@ class SensorAcquisitionWorker:
         spd_11_12 = 1000.0 if is_medium else 300.0
         acc_11_12 = 200.0 if is_medium else 50.0
 
+        # DYNAMIC SPEED & ACCELERATION OVERRIDE FROM MODEL REGRESSION HEAD
+        if dyn_targets is not None and len(dyn_targets) == 8:
+            m1_spd, m1_acc = max(100.0, float(abs(dyn_targets[0]))), max(50.0, float(abs(dyn_targets[1])))
+            m2_spd, m2_acc = max(100.0, float(abs(dyn_targets[2]))), max(50.0, float(abs(dyn_targets[3])))
+            m11_spd, m11_acc = max(100.0, float(abs(dyn_targets[4]))), max(50.0, float(abs(dyn_targets[5])))
+            m12_spd, m12_acc = max(100.0, float(abs(dyn_targets[6]))), max(50.0, float(abs(dyn_targets[7])))
+        else:
+            m1_spd = m2_spd = spd_1_2
+            m1_acc = m2_acc = acc_1_2
+            m11_spd = m12_spd = spd_11_12
+            m11_acc = m12_acc = acc_11_12
+
         targets = []
         if movement_type == "flexion":
-            targets = [(12, -35.0, spd_11_12, acc_11_12)]
+            targets = [(12, -35.0, m12_spd, m12_acc)]
         elif movement_type == "extension":
-            targets = [(12, 30.0, spd_11_12, acc_11_12)]
+            targets = [(12, 30.0, m12_spd, m12_acc)]
         elif movement_type == "ulnar":
-            targets = [(11, 15.0, spd_11_12, acc_11_12)]
+            targets = [(11, 15.0, m11_spd, m11_acc)]
         elif movement_type == "radial":
-            targets = [(11, -10.0, spd_11_12, acc_11_12)]
+            targets = [(11, -10.0, m11_spd, m11_acc)]
         elif movement_type == "grasping":
             targets = [
-                (1, -150.0, spd_1_2, acc_1_2),
-                (2, 150.0, spd_1_2, acc_1_2),
-                (11, 0.0, spd_11_12, acc_11_12),
-                (12, 0.0, spd_11_12, acc_11_12)
+                (1, -150.0, m1_spd, m1_acc),
+                (2, 150.0, m2_spd, m2_acc),
+                (11, 0.0, m11_spd, m11_acc),
+                (12, 0.0, m12_spd, m12_acc)
             ]
+
+        # TRACKING BUFFERS FOR LIVE ERROR CALCULATION
+        wrist_true_spds, wrist_pred_spds = [], []
+        finger_true_spds, finger_pred_spds = [], []
 
         # PHASE 1: PATIENT TRYING (5s WINDOW)
         start_time = time.time()
@@ -578,7 +641,7 @@ class SensorAcquisitionWorker:
             self._finish_and_set_cooldown()
             return
 
-        # PHASE 2: MOTOR ASSIST WITH OVER-ANGLE GUARD
+        # PHASE 2: MOTOR ASSIST WITH LIVE MAE/RMSE SAMPLING
         self.current_movement_label = f"ASSISTING_{movement_type.upper()}"
         for cid, pos, spd, acc in targets:
             self.can_mgr.set_move(cid, pos, spd, acc)
@@ -590,10 +653,18 @@ class SensorAcquisitionWorker:
                 self._finish_and_set_cooldown()
                 return
 
-            for cid, target_angle, _, _ in targets:
-                cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
-                max_allowable_limit = abs(target_angle) + self.safety_overshoot_margin_deg
+            for cid, target_angle, pred_spd, _ in targets:
+                cur_pos, cur_spd, _ = self.can_mgr.get_motor_state_data(cid)
                 
+                # Sample actual vs predicted speeds per actuator group
+                if cid in [1, 2]:
+                    wrist_true_spds.append(abs(cur_spd))
+                    wrist_pred_spds.append(abs(pred_spd))
+                elif cid in [11, 12]:
+                    finger_true_spds.append(abs(cur_spd))
+                    finger_pred_spds.append(abs(pred_spd))
+
+                max_allowable_limit = abs(target_angle) + self.safety_overshoot_margin_deg
                 if abs(cur_pos) > max_allowable_limit:
                     self._trigger_internal_overangle_stop(
                         f"Motor {cid} position ({cur_pos:.1f}°) exceeded target limit ({max_allowable_limit:.1f}°)"
@@ -601,7 +672,14 @@ class SensorAcquisitionWorker:
                     self._finish_and_set_cooldown()
                     return
 
-            time.sleep(0.01)
+            time.sleep(0.02)  # Sample live telemetry at 50 Hz
+
+        # --- COMPUTE & LOG LIVE MAE & RMSE ---
+        self._calculate_and_log_test_metrics(
+            movement_type, 
+            wrist_true_spds, wrist_pred_spds, 
+            finger_true_spds, finger_pred_spds
+        )
 
         # PHASE 3: HOLD TARGET POSITION FOR 15 SECONDS
         for sec_left in range(15, 0, -1):
@@ -646,6 +724,51 @@ class SensorAcquisitionWorker:
             time.sleep(0.02)
 
         self._finish_and_set_cooldown()
+
+    def _calculate_and_log_test_metrics(self, movement_type, w_true, w_pred, f_true, f_pred):
+        """Calculates MAE/RMSE across actuator groups and logs to CSV."""
+        w_t = np.array(w_true, dtype=np.float32)
+        w_p = np.array(w_pred, dtype=np.float32)
+        f_t = np.array(f_true, dtype=np.float32)
+        f_p = np.array(f_pred, dtype=np.float32)
+
+        w_mae = np.mean(np.abs(w_t - w_p)) if len(w_t) > 0 else 0.0
+        w_rmse = np.sqrt(np.mean((w_t - w_p)**2)) if len(w_t) > 0 else 0.0
+
+        f_mae = np.mean(np.abs(f_t - f_p)) if len(f_t) > 0 else 0.0
+        f_rmse = np.sqrt(np.mean((f_t - f_p)**2)) if len(f_t) > 0 else 0.0
+
+        all_true = np.concatenate([w_t, f_t]) if len(w_t) > 0 or len(f_t) > 0 else np.array([])
+        all_pred = np.concatenate([w_p, f_p]) if len(w_p) > 0 or len(f_p) > 0 else np.array([])
+
+        tot_mae = np.mean(np.abs(all_true - all_pred)) if len(all_true) > 0 else 0.0
+        tot_rmse = np.sqrt(np.mean((all_true - all_pred)**2)) if len(all_true) > 0 else 0.0
+        sample_count = len(all_true)
+
+        # 1. Print Summary Report to Terminal
+        print("\n" + "="*58)
+        print(f"📊 LIVE PERFORMANCE TEST RESULTS ({movement_type.upper()})")
+        print("="*58)
+        print(f" Samples Evaluated : {sample_count}")
+        print(f" AK80-8  (Wrist)   : MAE = {w_mae:6.2f} eRPM | RMSE = {w_rmse:6.2f} eRPM")
+        print(f" AK40-10 (Finger)  : MAE = {f_mae:6.2f} eRPM | RMSE = {f_rmse:6.2f} eRPM")
+        print(f" OVERALL COMBINED  : MAE = {tot_mae:6.2f} eRPM | RMSE = {tot_rmse:6.2f} eRPM")
+        print("="*58 + "\n")
+
+        # 2. Append directly to CSV file
+        try:
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            with open(self.results_csv_path, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    timestamp, movement_type.upper(), sample_count,
+                    round(w_mae, 2), round(w_rmse, 2),
+                    round(f_mae, 2), round(f_rmse, 2),
+                    round(tot_mae, 2), round(tot_rmse, 2)
+                ])
+            print(f"💾 Metrics recorded to '{self.results_csv_path}'")
+        except Exception as e:
+            print(f"⚠️ Error logging to CSV: {e}")
 
     def _finish_and_set_cooldown(self):
         """Flushes buffers, unlocks motor torque to zero, and activates 3.0s cooldown."""
@@ -743,10 +866,10 @@ class SensorAcquisitionWorker:
                     rms_e = np.sqrt(np.mean(filt_e**2)) if len(filt_e) >= 10 else 0
                     
                     if (rms_f > self.emg_activation_threshold or rms_e > self.emg_activation_threshold):
-                        pred_class, confidence = self.run_inference_step([f1, f2, f3, f4, f5], [ax, ay, az], [gx, gy, gz])
+                        pred_class, confidence, pred_dynamics = self.run_inference_step([f1, f2, f3, f4, f5], [ax, ay, az], [gx, gy, gz])
                         if pred_class and confidence > 0.0:
                             print(f"🎯 MODEL DETECTED: {pred_class} ({confidence*100:.1f}%) -> Auto-Starting AAN")
-                            self.auto_trigger_smart_aan(pred_class)
+                            self.auto_trigger_smart_aan(pred_class, dyn_targets=pred_dynamics)
 
                 m1_pos, m1_spd, m1_tgt = self.can_mgr.get_motor_state_data(1)
                 m2_pos, m2_spd, m2_tgt = self.can_mgr.get_motor_state_data(2)
