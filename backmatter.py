@@ -8,6 +8,7 @@ from enum import IntEnum
 import numpy as np
 from collections import deque
 import joblib
+import csv
 
 from scipy.signal import butter, filtfilt
 import tensorflow as tf
@@ -411,6 +412,24 @@ class SensorAcquisitionWorker:
         print(f"📊 [PROBS] {probs_str} -> Top: {predicted_label} ({confidence:.2f} vs Req: {required_thresh:.2f})")
 
         if confidence >= required_thresh:
+            # --- LOG CLASSIFICATION RESULT FOR THESIS CHAPTER 4 ---
+            log_file = "live_classification_results.csv"
+            file_exists = os.path.exists(log_file)
+            try:
+                with open(log_file, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    if not file_exists:
+                        writer.writerow(['Timestamp', 'Movement', 'Confidence'])
+                    writer.writerow([
+                        time.strftime('%Y-%m-%d %H:%M:%S'),
+                        predicted_label,
+                        round(confidence, 4)
+                    ])
+                print(f"💾 Classification result recorded to '{log_file}'")
+            except Exception as e:
+                print(f"⚠️ Error logging classification: {e}")
+            # -----------------------------------------------------
+
             return predicted_label, confidence
 
         return None, 0.0
