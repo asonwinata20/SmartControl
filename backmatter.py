@@ -594,7 +594,7 @@ class SensorAcquisitionWorker:
         if patient_reached:
             self.current_movement_label = "PATIENT_SUCCESS"
             time.sleep(1.0)
-            self._finish_and_set_cooldown(targets)
+            self._return_to_zero_and_finish(targets)
             return
 
         # PHASE 2: MOTOR ASSIST WITH OVER-ANGLE GUARD
@@ -616,7 +616,7 @@ class SensorAcquisitionWorker:
                 if abs(cur_pos) > max_allowable_limit:
                     print(f"🚨 EXCEEDED TARGET LIMIT: Motor {cid} at {cur_pos:.1f}°. Returning to neutral 0.0°.")
                     self.current_movement_label = "EXCEEDED_LIMIT_RETURNING"
-                    self._finish_and_set_cooldown(targets)  # Gracefully brings it back to 0°
+                    self._return_to_zero_and_finish(targets)  # Gracefully brings it back to 0°
                     return
 
             time.sleep(0.01)
@@ -673,8 +673,41 @@ class SensorAcquisitionWorker:
         self.raw_emg_buffer_f.clear()
         self.raw_emg_buffer_e.clear()
         self.sequence_tensor_buffer.clear()
-        self.cooldown_until = time.time() + 6.0
+        self.cooldown_until = time.time() + 3.0
         self.current_movement_label = "LSTM_MONITORING" if self.auto_lstm_enabled else "IDLE"
+
+    def _return_to_zero_and_finish(self, targets):
+        """Drives motors back to 0.0°, locks inference via an extended cooldown, then releases."""
+        self.current_movement_label = "RETURNING_NEUTRAL"
+        
+        # Lock out new inferences for 10 seconds while returning
+        self.cooldown_until = time.time() + 10.0  
+
+        for cid, _, spd, acc in targets:
+            self.can_mgr.set_move(cid, 0.0, spd, acc)
+            time.sleep(0.005)
+
+        return_start = time.time()
+        max_return_timeout = 6.0
+        
+        while time.time() - return_start < max_return_timeout:
+            if self.e_stop_triggered:
+                break
+            
+            all_motors_at_zero = True
+            for cid, _, _, _ in targets:
+                cur_pos, _, _ = self.can_mgr.get_motor_state_data(cid)
+                if abs(cur_pos) > 2.5:
+                    all_motors_at_zero = False
+                    break
+
+            if all_motors_at_zero:
+                print("✅ All motors arrived back at neutral (0.0°).")
+                break
+                
+            time.sleep(0.02)
+
+        self._finish_and_set_cooldown()
 
     def voltage_to_percentage(self, volts, v_min, v_max):
         if volts <= v_min: return 0.0
