@@ -594,7 +594,7 @@ class SensorAcquisitionWorker:
         if patient_reached:
             self.current_movement_label = "PATIENT_SUCCESS"
             time.sleep(1.0)
-            self._finish_and_set_cooldown()
+            self._finish_and_set_cooldown(targets)
             return
 
         # PHASE 2: MOTOR ASSIST WITH OVER-ANGLE GUARD
