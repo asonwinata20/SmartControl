@@ -673,7 +673,7 @@ class SensorAcquisitionWorker:
         self.raw_emg_buffer_f.clear()
         self.raw_emg_buffer_e.clear()
         self.sequence_tensor_buffer.clear()
-        self.cooldown_until = time.time() + 3.0
+        self.cooldown_until = time.time() + 6.0
         self.current_movement_label = "LSTM_MONITORING" if self.auto_lstm_enabled else "IDLE"
 
     def voltage_to_percentage(self, volts, v_min, v_max):
