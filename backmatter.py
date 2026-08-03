@@ -614,10 +614,9 @@ class SensorAcquisitionWorker:
                 max_allowable_limit = abs(target_angle) + self.safety_overshoot_margin_deg
                 
                 if abs(cur_pos) > max_allowable_limit:
-                    self._trigger_internal_overangle_stop(
-                        f"Motor {cid} position ({cur_pos:.1f}°) exceeded target limit ({max_allowable_limit:.1f}°)"
-                    )
-                    self._finish_and_set_cooldown()
+                    print(f"🚨 EXCEEDED TARGET LIMIT: Motor {cid} at {cur_pos:.1f}°. Returning to neutral 0.0°.")
+                    self.current_movement_label = "EXCEEDED_LIMIT_RETURNING"
+                    self._finish_and_set_cooldown(targets)  # Gracefully brings it back to 0°
                     return
 
             time.sleep(0.01)
