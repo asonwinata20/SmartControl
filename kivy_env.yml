@@ -1,27 +1,12 @@
 name: kivy_env
 channels:
   - conda-forge
-  - defaults
+  - nodefaults
 dependencies:
-  - bzip2=1.0.8=h2bbff1b_6
-  - ca-certificates=2026.5.14=haa95532_0
-  - libffi=3.4.8=h42d73b9_3
-  - libzlib=1.3.2=h1c6eee0_0
-  - openssl=3.5.6=hbb43b14_0
-  - packaging=26.0=py311haa95532_0
-  - pip=26.1.1=pyhc872135_1
-  - python=3.11.7=he1021f5_0
-  - setuptools=82.0.1=py311haa95532_0
-  - sqlite=3.53.2=hee5a0db_0
-  - tk=8.6.15=hf199647_0
-  - tzdata=2026b=he532380_0
-  - ucrt=10.0.22621.0=haa95532_0
-  - vc=14.3=h2df5915_12
-  - vc14_runtime=14.44.35208=h4927774_12
-  - vs2015_runtime=14.44.35208=ha6b5a95_12
-  - wheel=0.47.0=py311haa95532_0
-  - xz=5.8.2=h53af0af_0
-  - zlib=1.3.2=h1c6eee0_0
+  - python=3.11.7
+  - pip
+  - setuptools
+  - wheel
   - pip:
       - absl-py==2.5.0
       - adafruit-blinka==9.1.0
@@ -49,9 +34,6 @@ dependencies:
       - idna==3.18
       - keras==3.15.1
       - kivy==2.3.1
-      - kivy-deps-angle==0.4.0
-      - kivy-deps-glew==0.3.1
-      - kivy-deps-sdl2==0.8.0
       - kivy-garden==0.1.5
       - libclang==18.1.1
       - markdown==3.10.3
@@ -70,11 +52,8 @@ dependencies:
       - pygments==2.20.0
       - pyinstaller==6.21.0
       - pyinstaller-hooks-contrib==2026.6
-      - pypiwin32==223
       - pyserial==3.5
       - pyusb==1.3.1
-      - pywin32==312
-      - pywin32-ctypes==0.2.3
       - requests==2.34.2
       - rich==15.0.0
       - six==1.17.0
@@ -88,4 +67,3 @@ dependencies:
       - urllib3==2.7.0
       - werkzeug==3.1.8
       - wrapt==2.3.0
-prefix: C:\Users\Anderson\anaconda3\envs\kivy_env
